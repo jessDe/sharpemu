@@ -99,10 +99,12 @@ public static class KernelMemoryCompatExports
     private static readonly object _tlsGate = new();
     private static readonly object _ioTraceGate = new();
     private static readonly object _statCacheGate = new();
+    private static readonly object _guestMountGate = new();
     private static readonly Dictionary<ulong, DirectAllocation> _directAllocations = new();
     private static readonly Dictionary<ulong, LibcHeapAllocation> _libcAllocations = new();
     private static readonly Dictionary<ulong, MappedRegion> _mappedRegions = new();
     private static readonly Dictionary<ulong, ulong> _tlsModuleBlocks = new();
+    private static readonly Dictionary<string, string> _guestMounts = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> _tracedStatResults = new(StringComparer.Ordinal);
     private static readonly HashSet<string> _negativeStatCache = new(StringComparer.OrdinalIgnoreCase);
     private static long _nextFileDescriptor = 2;
@@ -152,6 +154,32 @@ public static class KernelMemoryCompatExports
     private readonly record struct LibcHeapAllocation(nint BaseAddress, nuint Size, nuint Alignment);
     private readonly record struct MappedRegion(ulong Address, ulong Length, int Protection, bool IsFlexible, bool IsDirect, ulong DirectStart);
     private readonly record struct BatchMapEntry(ulong Start, ulong Offset, ulong Length, byte Protection, byte Type, int Operation);
+
+    public static void RegisterGuestPathMount(string guestMountPoint, string hostRoot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(guestMountPoint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(hostRoot);
+
+        var normalizedMountPoint = NormalizeGuestStatCachePath(guestMountPoint);
+        if (normalizedMountPoint is null || normalizedMountPoint == "/")
+        {
+            throw new ArgumentException("Guest mount point must name a directory.", nameof(guestMountPoint));
+        }
+
+        var normalizedHostRoot = Path.GetFullPath(hostRoot);
+        Directory.CreateDirectory(normalizedHostRoot);
+        lock (_guestMountGate)
+        {
+            _guestMounts[normalizedMountPoint] = normalizedHostRoot;
+        }
+
+        lock (_statCacheGate)
+        {
+            _negativeStatCache.RemoveWhere(path =>
+                string.Equals(path, normalizedMountPoint, StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith(normalizedMountPoint + "/", StringComparison.OrdinalIgnoreCase));
+        }
+    }
 
     internal static bool TryAllocateHleData(
         CpuContext ctx,
@@ -4033,6 +4061,11 @@ public static class KernelMemoryCompatExports
             return guestPath;
         }
 
+        if (TryResolveRegisteredGuestMount(guestPath, out var mountedPath))
+        {
+            return mountedPath;
+        }
+
         if (guestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase))
         {
             var relative = NormalizeMountRelativePath(guestPath["/devlog/app/".Length..]);
@@ -4129,6 +4162,51 @@ public static class KernelMemoryCompatExports
         }
 
         return guestPath;
+    }
+
+    private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
+    {
+        hostPath = string.Empty;
+        var normalizedGuestPath = NormalizeGuestStatCachePath(guestPath);
+        if (normalizedGuestPath is null)
+        {
+            return false;
+        }
+
+        string? matchedMountPoint = null;
+        string? matchedHostRoot = null;
+        lock (_guestMountGate)
+        {
+            foreach (var (mountPoint, hostRoot) in _guestMounts)
+            {
+                if ((string.Equals(normalizedGuestPath, mountPoint, StringComparison.OrdinalIgnoreCase) ||
+                     normalizedGuestPath.StartsWith(mountPoint + "/", StringComparison.OrdinalIgnoreCase)) &&
+                    (matchedMountPoint is null || mountPoint.Length > matchedMountPoint.Length))
+                {
+                    matchedMountPoint = mountPoint;
+                    matchedHostRoot = hostRoot;
+                }
+            }
+        }
+
+        if (matchedMountPoint is null || matchedHostRoot is null)
+        {
+            return false;
+        }
+
+        var relativePath = normalizedGuestPath[matchedMountPoint.Length..].TrimStart('/');
+        var candidate = Path.GetFullPath(Path.Combine(
+            matchedHostRoot,
+            NormalizeMountRelativePath(relativePath)));
+        var rootWithSeparator = Path.TrimEndingDirectorySeparator(matchedHostRoot) + Path.DirectorySeparatorChar;
+        if (!string.Equals(candidate, matchedHostRoot, StringComparison.OrdinalIgnoreCase) &&
+            !candidate.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        hostPath = candidate;
+        return true;
     }
 
     private static string? ResolveApp0Root()

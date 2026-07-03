@@ -306,15 +306,35 @@ public static class KernelExports
     {
         var threadId = ctx[CpuRegister.Rdi];
         var returnValueAddress = ctx[CpuRegister.Rsi];
-        if (returnValueAddress != 0 && !ctx.TryWriteUInt64(returnValueAddress, 0))
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-        }
 
         if (ShouldTracePthread())
         {
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] pthread_join: thread=0x{threadId:X16} retval_out=0x{returnValueAddress:X16}");
+        }
+
+        var returnValue = 0UL;
+        if (GuestThreadExecution.Scheduler is { } scheduler &&
+            !scheduler.TryJoinThread(ctx, threadId, out returnValue, out var error))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] pthread_join: thread=0x{threadId:X16}: {error}");
+            var result = string.Equals(
+                error,
+                "thread cannot join itself",
+                StringComparison.Ordinal)
+                ? OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
+                : OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
+            return (int)result;
+        }
+
+        if (returnValueAddress != 0 &&
+            !ctx.TryWriteUInt64(returnValueAddress, returnValue))
+        {
+            ctx[CpuRegister.Rax] =
+                unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = 0;

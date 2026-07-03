@@ -723,6 +723,7 @@ public sealed partial class DirectExecutionBackend
 			"Vo5V8KAwCmk" or // sceSystemServiceHideSplashScreen
 			"TywrFKCoLGY" or // sceSaveDataInitialize3
 			"dyIhnXq-0SM" or // sceSaveDataDirNameSearch
+			"ZP4e7rlzOUk" or // sceSaveDataMount3
 			"ERKzksauAJA" or // sceSaveDataDialogGetStatus
 			"KK3Bdg1RWK0" or // sceSaveDataDialogUpdateStatus
 			"en7gNVnh878" or // sceSaveDataDialogIsReadyToDisplay

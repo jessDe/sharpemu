@@ -355,6 +355,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public GuestThreadRunState State { get; set; }
 
+		public ulong ExitValue { get; set; }
+
 		public string? BlockReason { get; set; }
 
 		public bool HasBlockedContinuation { get; set; }
@@ -1266,7 +1268,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			   libraryName.IndexOf("Kernel", StringComparison.OrdinalIgnoreCase) >= 0;
 	}
 
-	private static bool PreferLleForLibcExport(string exportName)
+	private bool PreferLleForLibcExport(string exportName)
 	{
 		if (string.IsNullOrWhiteSpace(exportName))
 		{
@@ -1287,6 +1289,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return true;
 		}
+		if (IsLibcAllocatorExport(exportName))
+		{
+			return CanUseLleLibcAllocatorFamily();
+		}
 		if (string.Equals(value, "0", StringComparison.Ordinal))
 		{
 			return true;
@@ -1296,6 +1302,51 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return IsSafeLleLibcExport(exportName);
 		}
 		return IsSafeLleLibcExport(exportName);
+	}
+
+	private bool CanUseLleLibcAllocatorFamily()
+	{
+		return HasUsableLleLibcExport("gQX+4GDQjpM", "malloc") &&
+			   HasUsableLleLibcExport("tIhsqj0qsFE", "free") &&
+			   HasUsableLleLibcExport("2X5agFjKxMc", "calloc") &&
+			   HasUsableLleLibcExport("Y7aJ1uydPMo", "realloc") &&
+			   HasUsableLleLibcExport("Ujf3KzMvRmI", "memalign") &&
+			   HasUsableLleLibcExport("2Btkg8k24Zg", "aligned_alloc") &&
+			   HasUsableLleLibcExport("cVSk9y8URbc", "posix_memalign");
+	}
+
+	private bool HasUsableLleLibcExport(string nid, string exportName)
+	{
+		if (TryResolveRuntimeSymbolAddress(nid, out var address) && IsDirectImportTargetUsable(address))
+		{
+			return true;
+		}
+
+		foreach (var candidate in EnumerateRuntimeSymbolCandidates(exportName))
+		{
+			if (TryResolveRuntimeSymbolAddress(candidate, out address) && IsDirectImportTargetUsable(address))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private static bool IsLibcAllocatorExport(string exportName)
+	{
+		return exportName switch
+		{
+			"malloc" or
+			"free" or
+			"calloc" or
+			"realloc" or
+			"memalign" or
+			"aligned_alloc" or
+			"posix_memalign" or
+			"malloc_usable_size" => true,
+			_ => false,
+		};
 	}
 
 	private static bool IsSafeLleLibcExport(string exportName)
@@ -2406,6 +2457,69 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	public bool SupportsGuestContextTransfer => true;
 
+	public bool TryJoinThread(
+		CpuContext callerContext,
+		ulong threadHandle,
+		out ulong returnValue,
+		out string? error)
+	{
+		returnValue = 0;
+		error = null;
+		if (threadHandle == 0)
+		{
+			error = "thread handle is zero";
+			return false;
+		}
+
+		if (threadHandle == GuestThreadExecution.CurrentGuestThreadHandle)
+		{
+			error = "thread cannot join itself";
+			return false;
+		}
+
+		while (!ActiveForcedGuestExit)
+		{
+			Thread? hostThread;
+			lock (_guestThreadGate)
+			{
+				if (!_guestThreads.TryGetValue(threadHandle, out var thread))
+				{
+					error = $"unknown guest thread 0x{threadHandle:X16}";
+					return false;
+				}
+
+				if (thread.State == GuestThreadRunState.Exited)
+				{
+					returnValue = thread.ExitValue;
+					return true;
+				}
+
+				if (thread.State == GuestThreadRunState.Faulted)
+				{
+					error =
+						$"guest thread 0x{threadHandle:X16} faulted: " +
+						(thread.BlockReason ?? "unknown error");
+					return false;
+				}
+
+				hostThread = thread.HostThread;
+			}
+
+			if (hostThread is not null &&
+				!ReferenceEquals(hostThread, Thread.CurrentThread))
+			{
+				hostThread.Join(1);
+			}
+			else
+			{
+				Thread.Sleep(1);
+			}
+		}
+
+		error = "guest execution stopped while joining thread";
+		return false;
+	}
+
 	public void Pump(CpuContext callerContext, string reason)
 	{
 		_ = callerContext;
@@ -3254,6 +3368,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				switch (exitReason)
 				{
 					case GuestNativeCallExitReason.Returned:
+						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
 						break;
 					case GuestNativeCallExitReason.Blocked:
