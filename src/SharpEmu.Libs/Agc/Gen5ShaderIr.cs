@@ -276,6 +276,8 @@ internal sealed record Gen5VertexInputBinding(
     uint Pc,
     uint Location,
     uint ComponentCount,
+    uint DataFormat,
+    uint NumberFormat,
     ulong BaseAddress,
     uint Stride,
     uint OffsetBytes,

@@ -212,12 +212,26 @@ internal static partial class Gen5SpirvTranslator
                 case "VSinF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(13, _floatType, GetFloatSource(instruction, 0)));
+                        Ext(
+                            13,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                GetFloatSource(instruction, 0),
+                                Float(MathF.Tau))));
                     break;
                 case "VCosF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(14, _floatType, GetFloatSource(instruction, 0)));
+                        Ext(
+                            14,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                GetFloatSource(instruction, 0),
+                                Float(MathF.Tau))));
                     break;
                 case "VAddF32":
                     result = EmitFloatBinary(instruction, SpirvOp.FAdd);
@@ -637,11 +651,13 @@ internal static partial class Gen5SpirvTranslator
                 }
                 case "VCvtPkrtzF16F32":
                 {
+                    var first = TruncateFloat32ForPack(GetFloatSource(instruction, 0));
+                    var second = TruncateFloat32ForPack(GetFloatSource(instruction, 1));
                     var vector = _module.AddInstruction(
                         SpirvOp.CompositeConstruct,
                         _vec2Type,
-                        GetFloatSource(instruction, 0),
-                        GetFloatSource(instruction, 1));
+                        first,
+                        second);
                     result = Ext(58, _uintType, vector);
                     break;
                 }
@@ -2065,6 +2081,14 @@ internal static partial class Gen5SpirvTranslator
             }
 
             return Bitcast(_uintType, value);
+        }
+
+        private uint TruncateFloat32ForPack(uint value)
+        {
+            var raw = BitwiseAnd(
+                Bitcast(_uintType, value),
+                UInt(0xFFFF_E000));
+            return Bitcast(_floatType, raw);
         }
 
         private uint Ext(uint operation, uint resultType, params uint[] operands)

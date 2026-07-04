@@ -142,7 +142,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedDcbSizes = new();
     private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
     private static readonly HashSet<(ulong Es, ulong Ps)> _tracedShaderDecodePairs = new();
-    private static readonly HashSet<(ulong Es, ulong Ps, ulong Target)> _tracedShaderDraws = new();
+    private static readonly HashSet<(ulong Es, ulong Ps, ulong Target, ulong Texture, uint VertexCount)> _tracedShaderDraws = new();
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
@@ -2788,7 +2788,7 @@ public static class AgcExports
                 $"ps=0x{(hasPixelShader ? pixelShaderAddress : 0):X16}");
         }
 
-        if (vertexCount is not (3 or 4 or 6))
+        if (vertexCount == 0 || vertexCount > 1_048_576)
         {
             return;
         }
@@ -2872,8 +2872,9 @@ public static class AgcExports
 
             lock (_submitTraceGate)
             {
+                var firstTextureAddress = translatedDraw.Textures.FirstOrDefault()?.Descriptor.Address ?? 0;
                 if (_tracedShaderDraws.Add(
-                        (exportShaderAddress, pixelShaderAddress, firstTarget.Address)))
+                        (exportShaderAddress, pixelShaderAddress, firstTarget.Address, firstTextureAddress, vertexCount)))
                 {
                     TraceTranslatedGuestDraw(
                         ctx,
@@ -3033,6 +3034,11 @@ public static class AgcExports
                 return false;
             }
 
+            TraceAgcShader(
+                $"agc.texture_binding ps=0x{pixelShaderAddress:X16} es=0x{exportShaderAddress:X16} " +
+                $"pc=0x{binding.Pc:X} op={binding.Opcode} storage={(Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode) ? 1 : 0)} " +
+                $"decoded={FormatTextureDescriptor(texture)} " +
+                $"raw={FormatShaderDwords(binding.ResourceDescriptor)} sampler={FormatShaderDwords(binding.SamplerDescriptor)}");
             textures.Add(
                 new TranslatedImageBinding(
                     texture,
@@ -3477,7 +3483,8 @@ public static class AgcExports
                 ',',
                 draw.VertexInputs.Select(input =>
                     $"{input.Location}:pc=0x{input.Pc:X}:0x{input.BaseAddress:X16}" +
-                    $":stride{input.Stride}:off{input.OffsetBytes}:c{input.ComponentCount}"));
+                    $":stride{input.Stride}:off{input.OffsetBytes}:c{input.ComponentCount}" +
+                    $":fmt{input.DataFormat}/num{input.NumberFormat}"));
         var scissor = draw.RenderState.Scissor is { } drawScissor
             ? $"{drawScissor.X},{drawScissor.Y},{drawScissor.Width}x{drawScissor.Height}"
             : "full";
@@ -3550,6 +3557,8 @@ public static class AgcExports
             buffers[index] = new VulkanGuestVertexBuffer(
                 binding.Location,
                 binding.ComponentCount,
+                binding.DataFormat,
+                binding.NumberFormat,
                 binding.BaseAddress,
                 binding.Stride,
                 binding.OffsetBytes,
@@ -3579,7 +3588,10 @@ public static class AgcExports
         }
 
         var sourceWidth = descriptor.TileMode == 0
-            ? Math.Max(descriptor.Width, descriptor.Pitch)
+            ? GetLinearTexturePitch(
+                Math.Max(descriptor.Width, descriptor.Pitch),
+                descriptor.Height,
+                descriptor.Format)
             : descriptor.Width;
         var sourceByteCount = GetTextureByteCount(
             descriptor.Format,
@@ -3617,7 +3629,7 @@ public static class AgcExports
                 IsStorage: true,
                 MipLevels: descriptor.MipLevels,
                 MipLevel: mipLevel,
-                Pitch: descriptor.Pitch,
+                Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
                 Sampler: ToVulkanSampler(samplerDescriptor));
@@ -3663,7 +3675,7 @@ public static class AgcExports
             IsStorage: isStorage,
             MipLevels: descriptor.MipLevels,
             MipLevel: mipLevel,
-            Pitch: descriptor.Pitch,
+            Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
             Sampler: ToVulkanSampler(samplerDescriptor));
@@ -4326,6 +4338,28 @@ public static class AgcExports
             : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
     }
 
+    private static uint GetLinearTexturePitch(uint pitch, uint height, uint format)
+    {
+        var bytesPerTexel = GetTextureBytesPerTexel(format);
+        if (bytesPerTexel == 0 || height == 0)
+        {
+            return pitch;
+        }
+
+        var pitchAlignment = Math.Max(8UL, 64UL / bytesPerTexel);
+        var alignedPitch = AlignUp(pitch, pitchAlignment);
+        var sliceAlignment = Math.Max(64UL, 256UL / bytesPerTexel);
+        while ((alignedPitch * height) % sliceAlignment != 0)
+        {
+            alignedPitch += pitchAlignment;
+        }
+
+        return checked((uint)alignedPitch);
+    }
+
+    private static ulong AlignUp(ulong value, ulong alignment) =>
+        (value + alignment - 1) & ~(alignment - 1);
+
     private static void TraceShaderTranslationMiss(
         CpuContext ctx,
         SubmittedDcbState state,
@@ -4594,6 +4628,10 @@ public static class AgcExports
             return false;
         }
 
+        // GFX10/RDNA2 T# layout: WIDTH is split across word1[31:30] (lo 2 bits)
+        // and word2[11:0] (hi 12 bits); FORMAT is the combined 9-bit field at
+        // word1[28:20]. Verified against Kyty's decode of the same game
+        // descriptors (fmt=56=8_8_8_8_UNORM, extent 1280x720, sw_mode 27).
         // GNM T# exposes a 38-bit baseaddr256 field, but RPCSX and the
         // Demon's Souls descriptors both show that only the low 32 bits are
         // part of the guest GPU VA. The upper baseaddr bits carry resource
@@ -5366,6 +5404,12 @@ public static class AgcExports
         values.Count == 0
             ? "none"
             : string.Join(',', values.Select(static value => $"{value:X8}"));
+
+    private static string FormatTextureDescriptor(TextureDescriptor descriptor) =>
+        $"addr=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} " +
+        $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
+        $"type={descriptor.Type} levels={descriptor.BaseLevel}-{descriptor.LastLevel} " +
+        $"pitch={descriptor.Pitch} dst=0x{descriptor.DstSelect:X3}";
 
     private static void DumpSpirv(
         string stage,
