@@ -276,6 +276,22 @@ public static class KernelEventQueueCompatExports
         var outCountAddress = ctx[CpuRegister.Rcx];
         var timeoutAddress = ctx[CpuRegister.R8];
 
+        if (!IsValidEqueue(handle))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (eventsAddress == 0 || eventCapacity < 1)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        uint timeoutUsec = 0;
+        if (timeoutAddress != 0 && !TryReadUInt32(ctx, timeoutAddress, out timeoutUsec))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         var deliveredCount = DequeueEvents(ctx, handle, eventsAddress, eventCapacity);
         if (outCountAddress != 0 && !TryWriteUInt32(ctx, outCountAddress, (uint)deliveredCount))
         {
@@ -298,6 +314,41 @@ public static class KernelEventQueueCompatExports
         {
             TraceEventQueue(ctx, "wait-block", handle);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (timeoutAddress != 0 && ctx.TryReadUInt64(timeoutAddress, out var timeoutRaw))
+        {
+            var timeoutMicros = timeoutRaw & 0xFFFF_FFFFUL;
+            var deadline = Environment.TickCount64 +
+                Math.Max(1L, (long)Math.Min(timeoutMicros / 1000, int.MaxValue));
+            lock (_eventQueueGate)
+            {
+                while (!HasPendingEvents(handle))
+                {
+                    var remaining = deadline - Environment.TickCount64;
+                    if (remaining <= 0)
+                    {
+                        break;
+                    }
+
+                    Monitor.Wait(_eventQueueGate, (int)Math.Min(remaining, 100));
+                }
+            }
+
+            deliveredCount = DequeueEvents(ctx, handle, eventsAddress, eventCapacity);
+            if (outCountAddress != 0 && !TryWriteUInt32(ctx, outCountAddress, (uint)deliveredCount))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (deliveredCount > 0)
+            {
+                TraceEventQueue(ctx, "wait-timed-deliver", handle);
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            TraceEventQueue(ctx, "wait-timeout", handle);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
         }
 
         TraceEventQueue(ctx, "wait", handle);
@@ -330,6 +381,7 @@ public static class KernelEventQueueCompatExports
 
             queue.AddLast(queuedEvent);
             queued = true;
+            Monitor.PulseAll(_eventQueueGate);
         }
 
         if (queued)
@@ -494,7 +546,9 @@ public static class KernelEventQueueCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return deliveredCount > 0
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
     }
 
     private static bool HasPendingEvents(ulong handle)
@@ -611,5 +665,18 @@ public static class KernelEventQueueCompatExports
         Span<byte> buffer = stackalloc byte[sizeof(uint)];
         BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static bool TryReadUInt32(CpuContext ctx, ulong address, out uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+        return true;
     }
 }

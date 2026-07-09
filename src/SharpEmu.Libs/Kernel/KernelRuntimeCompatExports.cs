@@ -7,7 +7,6 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using System.Security.Cryptography;
@@ -87,11 +86,11 @@ public static class KernelRuntimeCompatExports
 
         if (micros < 1000)
         {
-            // Guest worker pools use usleep(1) as a polling backoff. Periodically
-            // relinquish a full host time slice so spin workers cannot starve producers.
-            if ((++_shortUsleepCount & 31) == 0)
+            // Guest worker pools use usleep(1) as a polling backoff. Do not turn
+            // PS microsecond waits into Windows millisecond sleeps on hot paths.
+            if ((++_shortUsleepCount & 255) == 0)
             {
-                Thread.Sleep(1);
+                Thread.Sleep(0);
             }
             else
             {
@@ -739,8 +738,11 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        Console.Error.WriteLine(
-            $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16} flags=0x{flags:X8} align=0x{effectiveAlignment:X16}");
+        if (ShouldTraceVirtualMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16} flags=0x{flags:X8} align=0x{effectiveAlignment:X16}");
+        }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {
@@ -1733,117 +1735,16 @@ public static class KernelRuntimeCompatExports
         bool allowSearch,
         out ulong mappedAddress)
     {
-        mappedAddress = 0;
-        if (length == 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            object memoryObject = ctx.Memory;
-            MethodInfo? allocateAt = null;
-            MethodInfo? allocateAtOrAbove = null;
-            var allocateAtHasAllowAlternativeArg = false;
-            for (var depth = 0; depth < 4; depth++)
-            {
-                foreach (var candidate in memoryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
-                {
-                    var parameters = candidate.GetParameters();
-                    if (string.Equals(candidate.Name, "TryAllocateAtOrAbove", StringComparison.Ordinal) &&
-                        parameters.Length == 5 &&
-                        parameters[0].ParameterType == typeof(ulong) &&
-                        parameters[1].ParameterType == typeof(ulong) &&
-                        parameters[2].ParameterType == typeof(bool) &&
-                        parameters[3].ParameterType == typeof(ulong) &&
-                        parameters[4].ParameterType == typeof(ulong).MakeByRefType())
-                    {
-                        allocateAtOrAbove = candidate;
-                    }
-                    else if (string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
-                    {
-                        if (parameters.Length == 3 &&
-                            parameters[0].ParameterType == typeof(ulong) &&
-                            parameters[1].ParameterType == typeof(ulong) &&
-                            parameters[2].ParameterType == typeof(bool))
-                        {
-                            allocateAt = candidate;
-                            allocateAtHasAllowAlternativeArg = false;
-                        }
-                        else if (parameters.Length == 4 &&
-                            parameters[0].ParameterType == typeof(ulong) &&
-                            parameters[1].ParameterType == typeof(ulong) &&
-                            parameters[2].ParameterType == typeof(bool) &&
-                            parameters[3].ParameterType == typeof(bool))
-                        {
-                            allocateAt = candidate;
-                            allocateAtHasAllowAlternativeArg = true;
-                        }
-                    }
-
-                    if (allocateAtOrAbove is not null && allocateAt is not null)
-                    {
-                        break;
-                    }
-                }
-
-                if (allocateAtOrAbove is not null || allocateAt is not null)
-                {
-                    break;
-                }
-
-                var innerProperty = memoryObject.GetType().GetProperty("Inner", BindingFlags.Public | BindingFlags.Instance);
-                if (innerProperty is null)
-                {
-                    break;
-                }
-
-                var innerValue = innerProperty.GetValue(memoryObject);
-                if (innerValue is null || ReferenceEquals(innerValue, memoryObject))
-                {
-                    break;
-                }
-
-                memoryObject = innerValue;
-            }
-
-            if (allowSearch && allocateAtOrAbove is not null)
-            {
-                var searchArgs = new object[] { desiredAddress, length, false, alignment, 0UL };
-                var searchResult = allocateAtOrAbove.Invoke(memoryObject, searchArgs);
-                if (searchResult is bool trueValue && trueValue &&
-                    searchArgs[4] is ulong searchedAddress && searchedAddress != 0)
-                {
-                    mappedAddress = searchedAddress;
-                    return true;
-                }
-            }
-
-            if (allocateAt is null)
-            {
-                Console.Error.WriteLine($"[LOADER][TRACE] reserve_virtual_range: AllocateAt missing on {ctx.Memory.GetType().FullName}");
-                return false;
-            }
-
-            var invokeArgs = allocateAtHasAllowAlternativeArg
-                ? new object[] { desiredAddress, length, false, allowSearch }
-                : new object[] { desiredAddress, length, false };
-            var result = allocateAt.Invoke(memoryObject, invokeArgs);
-            if (result is not ulong allocated || allocated == 0)
-            {
-                var resultType = result?.GetType().FullName ?? "null";
-                Console.Error.WriteLine($"[LOADER][TRACE] reserve_virtual_range: AllocateAt returned {resultType} value={result ?? "null"}");
-                return false;
-            }
-
-            mappedAddress = allocated;
-            return true;
-        }
-        catch
-        {
-            Console.Error.WriteLine("[LOADER][TRACE] reserve_virtual_range: AllocateAt invocation threw");
-            return false;
-        }
+        return KernelVirtualRangeAllocator.TryReserve(
+            ctx,
+            desiredAddress,
+            length,
+            executable: false,
+            alignment,
+            allowSearch,
+            allowAllocateAtAlternative: allowSearch,
+            "reserve_virtual_range",
+            out mappedAddress);
     }
 
     private static ulong AlignUp(ulong value, ulong alignment)
@@ -1855,5 +1756,10 @@ public static class KernelRuntimeCompatExports
 
         var mask = alignment - 1;
         return (value + mask) & ~mask;
+    }
+
+    private static bool ShouldTraceVirtualMemory()
+    {
+        return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIRTUAL_MEMORY"), "1", StringComparison.Ordinal);
     }
 }

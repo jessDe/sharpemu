@@ -879,6 +879,8 @@ internal static unsafe class VulkanVideoPresenter
         private bool _swapchainRecreateDeferred;
         private bool _tracedPresentedSwapchain;
         private bool _swapchainReadbackPending;
+        private bool _deviceLost;
+        private bool _deviceLostLogged;
         private int _directPresentationCount;
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
@@ -2816,7 +2818,8 @@ internal static unsafe class VulkanVideoPresenter
                     dstSelect: texture.DstSelect,
                     out var view))
             {
-                if (_tracedTextureCacheHits.Add(
+                if (ShouldTraceVulkanResources() &&
+                    _tracedTextureCacheHits.Add(
                         (texture.Address, texture.Width, texture.Height, vkFormat)))
                 {
                     Console.Error.WriteLine(
@@ -3395,7 +3398,8 @@ internal static unsafe class VulkanVideoPresenter
                 out var memory);
             var size = (ulong)Math.Max(guestBuffer.Data.Length, sizeof(uint));
 
-            if (_tracedGlobalBuffers.Add((guestBuffer.BaseAddress, guestBuffer.Data.Length)))
+            if (ShouldTraceVulkanResources() &&
+                _tracedGlobalBuffers.Add((guestBuffer.BaseAddress, guestBuffer.Data.Length)))
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.global_buffer base=0x{guestBuffer.BaseAddress:X16} " +
@@ -4030,6 +4034,11 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteComputeDispatch(VulkanComputeGuestDispatch work)
         {
+            if (_deviceLost)
+            {
+                return;
+            }
+
             if (AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress))
             {
                 TraceVulkanShader(
@@ -4132,6 +4141,11 @@ internal static unsafe class VulkanVideoPresenter
             }
             catch (Exception exception)
             {
+                if (TryMarkDeviceLost(exception))
+                {
+                    return;
+                }
+
                 Console.Error.WriteLine(
                     $"[LOADER][ERROR] Vulkan compute dispatch failed " +
                     $"cs=0x{work.ShaderAddress:X16}: {exception.Message}");
@@ -4197,6 +4211,11 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDraw(VulkanOffscreenGuestDraw work)
         {
+            if (_deviceLost)
+            {
+                return;
+            }
+
             var format = GetRenderTargetFormat(work.Target.Format, work.Target.NumberType);
             if (format == Format.Undefined)
             {
@@ -4354,6 +4373,11 @@ internal static unsafe class VulkanVideoPresenter
             }
             catch (Exception exception)
             {
+                if (TryMarkDeviceLost(exception))
+                {
+                    return;
+                }
+
                 if (!_guestImages.TryGetValue(work.Target.Address, out var failedTarget) ||
                     !failedTarget.Initialized)
                 {
@@ -4809,7 +4833,10 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _commandBuffer = _presentationCommandBuffer;
-            CollectCompletedGuestSubmissions(waitForOldest: false);
+            if (!_deviceLost)
+            {
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+            }
 
             var completedWork = 0;
             while (completedWork < MaxGuestWorkPerRender &&
@@ -5667,6 +5694,12 @@ internal static unsafe class VulkanVideoPresenter
                    string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool ShouldTraceVulkanResources() =>
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_RESOURCES"),
+                "1",
+                StringComparison.Ordinal);
+
         private void RecordTranslatedGraphicsPass(
             TranslatedDrawResources resources,
             RenderPass renderPass,
@@ -6500,6 +6533,25 @@ internal static unsafe class VulkanVideoPresenter
             {
                 throw new InvalidOperationException($"{operation} failed with {result}.");
             }
+        }
+
+        private bool TryMarkDeviceLost(Exception exception)
+        {
+            if (!exception.Message.Contains(nameof(Result.ErrorDeviceLost), StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _deviceLost = true;
+            if (!_deviceLostLogged)
+            {
+                _deviceLostLogged = true;
+                Console.Error.WriteLine(
+                    "[LOADER][ERROR] Vulkan device lost; dropping subsequent guest GPU work. " +
+                    exception.Message);
+            }
+
+            return true;
         }
 
         private static void TraceVulkanShader(string message)

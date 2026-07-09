@@ -633,25 +633,56 @@ public sealed partial class DirectExecutionBackend
 			"ASoW5WE-UPo" or // sceKernelAprSubmitCommandBufferAndGetResult
 			"rqwFKI4PAiM" or // sceKernelAprWaitCommandBuffer
 			"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
-			"qvMUCyyaCSI";   // sceKernelAprSubmitCommandBufferAndGetId
+			"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
+			"Q2V+iqvjgC0" or // vsnprintf
+			"q1cHNfGycLI" or // scePadRead
+			"xk0AcarP3V4" or // scePadOpen
+			"yH17Q6NWtVg" or // sceUserServiceGetEvent
+			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
+			"K-jXhbt2gn4";   // scePthreadMutexTrylock
 
 	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
 	{
+		var resultValue = unchecked((int)result);
+		if (resultValue > 0)
+		{
+			return false;
+		}
+
 		var expectedFileProbeMiss =
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
 			IsExpectedFileProbeNotFoundNid(nid);
 		var expectedTimedWaitTimeout =
 			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
 			unchecked((int)result) == 60;
+		var expectedEqueueTimeout =
+			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
-		if (!expectedFileProbeMiss && !expectedTimedWaitTimeout && !expectedMutexTrylockBusy)
+		var expectedUserServiceNoEvent =
+			string.Equals(nid, "yH17Q6NWtVg", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80960007);
+		var expectedPrivacyInvalidParameter =
+			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80960009);
+		if (!expectedFileProbeMiss &&
+			!expectedTimedWaitTimeout &&
+			!expectedEqueueTimeout &&
+			!expectedMutexTrylockBusy &&
+			!expectedUserServiceNoEvent &&
+			!expectedPrivacyInvalidParameter)
 		{
 			return true;
 		}
 
-		var key = nid + "\0" + (int)result;
+		if (!ShouldLogExpectedImportResults())
+		{
+			return false;
+		}
+
+		var key = nid + "\0" + resultValue;
 		int count;
 		lock (_importResultLogSampleGate)
 		{
@@ -662,6 +693,12 @@ public sealed partial class DirectExecutionBackend
 
 		return count <= 8 || count % 10000 == 0;
 	}
+
+	private static bool ShouldLogExpectedImportResults() =>
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
+			"1",
+			StringComparison.Ordinal);
 
 	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
 		nid is

@@ -5,9 +5,9 @@ using SharpEmu.HLE;
 using SharpEmu.Libs.Ampr;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Threading;
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Linq;
 using System.Globalization;
@@ -108,6 +108,7 @@ public static class KernelMemoryCompatExports
     private static readonly Dictionary<string, string> _guestMounts = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> _tracedStatResults = new(StringComparer.Ordinal);
     private static readonly HashSet<string> _negativeStatCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(StringComparer.OrdinalIgnoreCase);
     private static long _nextFileDescriptor = 2;
     private static ulong _nextPhysicalAddress;
     private static ulong _nextVirtualAddress;
@@ -1342,6 +1343,7 @@ public static class KernelMemoryCompatExports
             if (IsMutatingOpen(flags))
             {
                 InvalidateNegativeStatCacheForPathAndAncestors(guestPath);
+                InvalidateAprFileSizeCache(hostPath);
             }
 
             LogOpenTrace($"_open file path='{guestPath}' host='{hostPath}' flags=0x{flags:X8} fd={fd}");
@@ -1550,6 +1552,7 @@ public static class KernelMemoryCompatExports
 
             File.Delete(hostPath);
             InvalidateNegativeStatCacheForPathAndAncestors(guestPath);
+            InvalidateAprFileSizeCache(hostPath);
             AddNegativeStatCacheForGuestPath(guestPath);
             LogOpenTrace($"unlink path='{guestPath}' host='{hostPath}'");
             ctx[CpuRegister.Rax] = 0;
@@ -2596,8 +2599,11 @@ public static class KernelMemoryCompatExports
         var length = ctx[CpuRegister.Rsi];
         var protection = unchecked((int)ctx[CpuRegister.Rdx]);
         var flags = ctx[CpuRegister.Rcx];
-        Console.Error.WriteLine(
-            $"[LOADER][TRACE] map_flexible: inout=0x{inOutAddressPointer:X16} len=0x{length:X16} prot=0x{protection:X8} flags=0x{flags:X16}");
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] map_flexible: inout=0x{inOutAddressPointer:X16} len=0x{length:X16} prot=0x{protection:X8} flags=0x{flags:X16}");
+        }
         if (inOutAddressPointer == 0 || length == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -2627,8 +2633,11 @@ public static class KernelMemoryCompatExports
                     : AllocateMappedGuestAddress(ctx, length, 0x1000UL);
             }
 
-            Console.Error.WriteLine(
-                $"[LOADER][TRACE] map_flexible reserve: requested=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16}");
+            if (ShouldTraceDirectMemory())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] map_flexible reserve: requested=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16}");
+            }
 
             if (mappedAddress == 0)
             {
@@ -3973,118 +3982,17 @@ public static class KernelMemoryCompatExports
         ulong alignment,
         out ulong mappedAddress)
     {
-        mappedAddress = 0;
-        if (length == 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            object memoryObject = ctx.Memory;
-            MethodInfo? allocateAt = null;
-            MethodInfo? allocateAtOrAbove = null;
-            var allocateAtHasAllowAlternativeArg = false;
-            for (var depth = 0; depth < 4; depth++)
-            {
-                foreach (var candidate in memoryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
-                {
-                    var parameters = candidate.GetParameters();
-                    if (string.Equals(candidate.Name, "TryAllocateAtOrAbove", StringComparison.Ordinal) &&
-                        parameters.Length == 5 &&
-                        parameters[0].ParameterType == typeof(ulong) &&
-                        parameters[1].ParameterType == typeof(ulong) &&
-                        parameters[2].ParameterType == typeof(bool) &&
-                        parameters[3].ParameterType == typeof(ulong) &&
-                        parameters[4].ParameterType == typeof(ulong).MakeByRefType())
-                    {
-                        allocateAtOrAbove = candidate;
-                    }
-                    else if (string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
-                    {
-                        if (parameters.Length == 3 &&
-                            parameters[0].ParameterType == typeof(ulong) &&
-                            parameters[1].ParameterType == typeof(ulong) &&
-                            parameters[2].ParameterType == typeof(bool))
-                        {
-                            allocateAt = candidate;
-                            allocateAtHasAllowAlternativeArg = false;
-                        }
-                        else if (parameters.Length == 4 &&
-                            parameters[0].ParameterType == typeof(ulong) &&
-                            parameters[1].ParameterType == typeof(ulong) &&
-                            parameters[2].ParameterType == typeof(bool) &&
-                            parameters[3].ParameterType == typeof(bool))
-                        {
-                            allocateAt = candidate;
-                            allocateAtHasAllowAlternativeArg = true;
-                        }
-                    }
-
-                    if (allocateAtOrAbove is not null && allocateAt is not null)
-                    {
-                        break;
-                    }
-                }
-
-                if (allocateAtOrAbove is not null || allocateAt is not null)
-                {
-                    break;
-                }
-
-                var innerProperty = memoryObject.GetType().GetProperty("Inner", BindingFlags.Public | BindingFlags.Instance);
-                if (innerProperty is null)
-                {
-                    break;
-                }
-
-                var innerValue = innerProperty.GetValue(memoryObject);
-                if (innerValue is null || ReferenceEquals(innerValue, memoryObject))
-                {
-                    break;
-                }
-
-                memoryObject = innerValue;
-            }
-
-            var executable = (protection & OrbisProtCpuExec) != 0;
-            if (allocateAtOrAbove is not null)
-            {
-                var searchArgs = new object[] { desiredAddress, length, executable, alignment, 0UL };
-                var searchResult = allocateAtOrAbove.Invoke(memoryObject, searchArgs);
-                if (searchResult is bool trueValue && trueValue &&
-                    searchArgs[4] is ulong searchedAddress && searchedAddress != 0)
-                {
-                    mappedAddress = searchedAddress;
-                    return true;
-                }
-            }
-
-            if (allocateAt is null)
-            {
-                Console.Error.WriteLine($"[LOADER][TRACE] reserve range: AllocateAt missing on {ctx.Memory.GetType().FullName}");
-                return false;
-            }
-
-            var invokeArgs = allocateAtHasAllowAlternativeArg
-                ? new object[] { desiredAddress, length, executable, false }
-                : new object[] { desiredAddress, length, executable };
-            var result = allocateAt.Invoke(memoryObject, invokeArgs);
-            if (result is not ulong allocated || allocated == 0)
-            {
-                var resultType = result?.GetType().FullName ?? "null";
-                Console.Error.WriteLine($"[LOADER][TRACE] reserve range: AllocateAt returned {resultType} value={result ?? "null"}");
-                return false;
-            }
-
-            mappedAddress = allocated;
-            return true;
-        }
-        catch
-        {
-            Console.Error.WriteLine("[LOADER][TRACE] reserve range threw while invoking AllocateAt");
-            return false;
-        }
+        var executable = (protection & OrbisProtCpuExec) != 0;
+        return KernelVirtualRangeAllocator.TryReserve(
+            ctx,
+            desiredAddress,
+            length,
+            executable,
+            alignment,
+            allowSearch: true,
+            allowAllocateAtAlternative: false,
+            "reserve range",
+            out mappedAddress);
     }
 
     private static bool IsMappedGuestRangeAvailable(
@@ -4237,6 +4145,20 @@ public static class KernelMemoryCompatExports
         var app0Root = ResolveApp0Root();
         if (!string.IsNullOrWhiteSpace(app0Root))
         {
+            if (string.Equals(guestPath, "$", StringComparison.Ordinal) ||
+                string.Equals(guestPath, "$/", StringComparison.Ordinal) ||
+                string.Equals(guestPath, "$\\", StringComparison.Ordinal))
+            {
+                return app0Root;
+            }
+
+            if (guestPath.StartsWith("$/", StringComparison.Ordinal) ||
+                guestPath.StartsWith("$\\", StringComparison.Ordinal))
+            {
+                var relative = NormalizeMountRelativePath(guestPath[2..]);
+                return Path.Combine(app0Root, relative);
+            }
+
             if (string.Equals(guestPath, "/app0", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(guestPath, "app0", StringComparison.OrdinalIgnoreCase))
             {
@@ -5899,22 +5821,40 @@ public static class KernelMemoryCompatExports
     private static bool TryGetAprFileSize(string hostPath, out ulong size)
     {
         size = 0;
+
+        string cachePath;
         try
         {
-            var fileInfo = new FileInfo(hostPath);
+            cachePath = Path.GetFullPath(hostPath);
+        }
+        catch
+        {
+            cachePath = hostPath;
+        }
+
+        if (_aprFileSizeCache.TryGetValue(cachePath, out size))
+        {
+            return true;
+        }
+
+        try
+        {
+            var fileInfo = new FileInfo(cachePath);
             if (fileInfo.Exists)
             {
                 var length = fileInfo.Length;
                 size = length < 0 ? 0UL : unchecked((ulong)length);
+                _aprFileSizeCache.TryAdd(cachePath, size);
                 return true;
             }
 
-            if (!new DirectoryInfo(hostPath).Exists)
+            if (!new DirectoryInfo(cachePath).Exists)
             {
                 return false;
             }
 
             size = 65536;
+            _aprFileSizeCache.TryAdd(cachePath, size);
             return true;
         }
         catch
@@ -6211,6 +6151,20 @@ public static class KernelMemoryCompatExports
 
             _negativeStatCache.Remove("/");
         }
+    }
+
+    private static void InvalidateAprFileSizeCache(string hostPath)
+    {
+        try
+        {
+            hostPath = Path.GetFullPath(hostPath);
+        }
+        catch
+        {
+            // The cache key remains the original path when normalization fails.
+        }
+
+        _aprFileSizeCache.TryRemove(hostPath, out _);
     }
 
     private static string PreviewIoBytes(byte[] buffer, int count, int maxBytes)

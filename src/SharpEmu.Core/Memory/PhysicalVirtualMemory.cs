@@ -11,7 +11,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 {
     private readonly ReaderWriterLockSlim _gate = new(LockRecursionPolicy.SupportsRecursion);
     private readonly object _guestAllocationGate = new();
+    private readonly object _allocationSearchHintGate = new();
     private readonly List<MemoryRegion> _regions = new();
+    private readonly Dictionary<(ulong DesiredAddress, ulong Alignment, bool Executable), ulong> _allocationSearchHints = new();
     private readonly Dictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
     private bool _disposed;
     private const ulong PageSize = 0x1000;
@@ -19,7 +21,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private const ulong GuestAllocationArenaSize = 0x0100_0000;
     private const ulong GuestAllocationArenaStartOffset = PageSize;
     private const ulong LargeDataReserveThreshold = 0x4000_0000UL; // 1 GiB
-    private const ulong LazyReservePrimeBytes = 0x5000_0000UL; // 1.25 GiB
+    private const ulong FullCommitRegionLimit = 4UL << 30;
+    private const ulong DefaultLazyReservePrimeBytes = 0x0400_0000UL; // 64 MiB
     private const ulong LazyReservePrimeChunkBytes = 0x0200_0000UL; // 32 MiB
 
     private const uint MEM_COMMIT = 0x1000;
@@ -35,6 +38,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private ulong _guestAllocationArenaBase;
     private ulong _guestAllocationOffset;
+    private static readonly ulong LazyReservePrimeBytes = ResolveLazyReservePrimeBytes();
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern void* VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
@@ -96,7 +100,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         var allocationKind = executable ? "executable memory" : "data memory";
-        Console.Error.WriteLine($"[VMEM] Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
+        TraceVmem($"Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
         return true;
     }
 
@@ -110,7 +114,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var allocationType = MEM_COMMIT | MEM_RESERVE;
         var reservedOnly = false;
-        var preferReserveOnly = !executable && alignedSize >= LargeDataReserveThreshold;
+        var preferReserveOnly = !executable &&
+            alignedSize >= LargeDataReserveThreshold &&
+            alignedSize > FullCommitRegionLimit;
 
         void* result = null;
         if (preferReserveOnly)
@@ -139,7 +145,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 throw new InvalidOperationException($"Failed to allocate exact mapping at 0x{desiredAddress:X16} ({alignedSize} bytes)");
             }
 
-            Console.Error.WriteLine($"[VMEM] Could not allocate at 0x{desiredAddress:X16}, trying any address...");
+            TraceVmem($"Could not allocate at 0x{desiredAddress:X16}, trying any address...");
             result = VirtualAlloc(null, (nuint)alignedSize, allocationType, protection);
 
             if (result == null)
@@ -193,12 +199,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     lazyPrimeState = committedBytes == primeBytes
                         ? $"ok:{committedBytes:X}"
                         : $"partial:{committedBytes:X}/{primeBytes:X}";
-                    Console.Error.WriteLine($"[VMEM] Primed lazy region: 0x{actualAddress:X16} - 0x{actualAddress + committedBytes:X16} ({committedBytes} bytes)");
+                    TraceVmem($"Primed lazy region: 0x{actualAddress:X16} - 0x{actualAddress + committedBytes:X16} ({committedBytes} bytes)");
                 }
                 else
                 {
                     lazyPrimeState = $"fail:{primeBytes:X}";
-                    Console.Error.WriteLine($"[VMEM] Failed to prime lazy region at 0x{actualAddress:X16} ({primeBytes} bytes), continuing with on-demand commit");
+                    TraceVmem($"Failed to prime lazy region at 0x{actualAddress:X16} ({primeBytes} bytes), continuing with on-demand commit");
                 }
             }
             else
@@ -227,7 +233,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var allocationKind = reservedOnly
             ? "reserved data memory (lazy commit)"
             : (executable ? "executable memory" : "data memory");
-        Console.Error.WriteLine($"[VMEM] Allocated {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes) lazy_prime={lazyPrimeState}");
+        TraceVmem($"Allocated {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes) lazy_prime={lazyPrimeState}");
 
         return actualAddress;
     }
@@ -247,7 +253,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
         var alignedSize = AlignUp(size, PageSize);
         var effectiveAlignment = Math.Max(PageSize, alignment == 0 ? PageSize : alignment);
-        var cursor = AlignUp(desiredAddress, effectiveAlignment);
+        var requestedCursor = AlignUp(desiredAddress, effectiveAlignment);
+        var cursor = GetAllocationSearchCursor(desiredAddress, requestedCursor, effectiveAlignment, executable);
 
         for (var attempt = 0; attempt < 0x10000; attempt++)
         {
@@ -267,6 +274,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 actualAddress = AllocateAt(cursor, alignedSize, executable, allowAlternative: false);
                 if (actualAddress == cursor)
                 {
+                    UpdateAllocationSearchCursor(desiredAddress, effectiveAlignment, executable, actualAddress + alignedSize);
                     return true;
                 }
 
@@ -334,6 +342,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
                 _regions.Clear();
                 _pageProtections.Clear();
+                lock (_allocationSearchHintGate)
+                {
+                    _allocationSearchHints.Clear();
+                }
             }
             finally
             {
@@ -390,7 +402,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             ApplySegmentProtection(mapStart, mapEnd, protection);
 
-            Console.Error.WriteLine($"[VMEM] Mapped segment: 0x{virtualAddress:X16} - 0x{virtualAddress + memorySize:X16} (file: {fileData.Length} bytes, prot: {protection})");
+            TraceVmem($"Mapped segment: 0x{virtualAddress:X16} - 0x{virtualAddress + memorySize:X16} (file: {fileData.Length} bytes, prot: {protection})");
         }
         finally
         {
@@ -793,6 +805,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             foreach (var region in _regions)
             {
                 var regionEnd = region.VirtualAddress + region.Size;
+                if (region.VirtualAddress >= end)
+                {
+                    break;
+                }
+
+                if (regionEnd <= address)
+                {
+                    continue;
+                }
+
                 if (address < regionEnd && region.VirtualAddress < end)
                 {
                     overlapEnd = Math.Max(overlapEnd, regionEnd);
@@ -805,6 +827,37 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         return overlapEnd != 0;
+    }
+
+    private ulong GetAllocationSearchCursor(
+        ulong desiredAddress,
+        ulong requestedCursor,
+        ulong alignment,
+        bool executable)
+    {
+        lock (_allocationSearchHintGate)
+        {
+            var key = (desiredAddress, alignment, executable);
+            if (_allocationSearchHints.TryGetValue(key, out var hintedCursor) &&
+                hintedCursor > requestedCursor)
+            {
+                return AlignUp(hintedCursor, alignment);
+            }
+        }
+
+        return requestedCursor;
+    }
+
+    private void UpdateAllocationSearchCursor(
+        ulong desiredAddress,
+        ulong alignment,
+        bool executable,
+        ulong nextCursor)
+    {
+        lock (_allocationSearchHintGate)
+        {
+            _allocationSearchHints[(desiredAddress, alignment, executable)] = AlignUp(nextCursor, alignment);
+        }
     }
 
     private static bool TryResolveRegionOffset(ulong address, ulong size, MemoryRegion region, out ulong offset)
@@ -973,6 +1026,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         var mask = alignment - 1;
         return checked((value + mask) & ~mask);
+    }
+
+    private static ulong ResolveLazyReservePrimeBytes()
+    {
+        var configured = Environment.GetEnvironmentVariable("SHARPEMU_LAZY_RESERVE_PRIME_MB");
+        if (ulong.TryParse(configured, out var megabytes))
+        {
+            return megabytes == 0
+                ? 0
+                : checked(Math.Min(megabytes, 4096UL) * 1024UL * 1024UL);
+        }
+
+        return DefaultLazyReservePrimeBytes;
+    }
+
+    private static void TraceVmem(string message)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VMEM"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[VMEM] {message}");
     }
 
     public void Dispose()
