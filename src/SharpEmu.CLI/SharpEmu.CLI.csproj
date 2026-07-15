@@ -58,6 +58,21 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
   <PropertyGroup>
     <NoWarn>$(NoWarn);1591</NoWarn>
+    <NativeGpuBuildDir>$(RepoRoot)artifacts\native\gpu-vulkan\bin</NativeGpuBuildDir>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <NativeGpuHostLibrary>$(NativeGpuBuildDir)\sharpemu_gpu_vulkan.dll</NativeGpuHostLibrary>
+    <NativeGpuHostFileName>sharpemu_gpu_vulkan.dll</NativeGpuHostFileName>
+    <NativeGpuHostSdlLibrary>$(NativeGpuBuildDir)\SDL3.dll</NativeGpuHostSdlLibrary>
+  </PropertyGroup>
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <NativeGpuHostLibrary>$(NativeGpuBuildDir)\libsharpemu_gpu_vulkan.so</NativeGpuHostLibrary>
+    <NativeGpuHostFileName>libsharpemu_gpu_vulkan.so</NativeGpuHostFileName>
+  </PropertyGroup>
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <NativeGpuHostLibrary>$(NativeGpuBuildDir)\libsharpemu_gpu_vulkan.dylib</NativeGpuHostLibrary>
+    <NativeGpuHostFileName>libsharpemu_gpu_vulkan.dylib</NativeGpuHostFileName>
   </PropertyGroup>
   
   <ItemGroup>
@@ -84,6 +99,20 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
       </ResolvedFileToPublish>
     </ItemGroup>
+  </Target>
+
+  <!-- Project-reference content does not reliably flow through a single-file
+       publish. Copy the optional native GPU runtime at the executable boundary
+       after bundling so NativeLibrary can resolve it by ABI name. -->
+  <Target Name="StageNativeGpuRuntime" AfterTargets="Publish"
+          Condition="Exists('$(NativeGpuHostLibrary)')">
+    <Copy SourceFiles="$(NativeGpuHostLibrary)"
+          DestinationFiles="$(PublishDir)$(NativeGpuHostFileName)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(NativeGpuHostSdlLibrary)"
+          DestinationFiles="$(PublishDir)SDL3.dll"
+          SkipUnchangedFiles="true"
+          Condition="'$(NativeGpuHostSdlLibrary)' != '' And Exists('$(NativeGpuHostSdlLibrary)')" />
   </Target>
 
 </Project>
