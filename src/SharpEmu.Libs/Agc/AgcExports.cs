@@ -2622,6 +2622,32 @@ public static partial class AgcExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    // Hands the game the driver-side context id its GPU event-queue packets
+    // reference. We key events purely on (equeue, ident, filter), so a single
+    // stable id satisfies the contract; the game only checks the call
+    // succeeded and threads the id back through later driver calls.
+    [SysAbiExport(
+        Nid = "Zw7uUVPulbw",
+        ExportName = "sceAgcDriverGetEqContextId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqContextId(CpuContext ctx)
+    {
+        var contextIdAddress = ctx[CpuRegister.Rdi];
+        if (contextIdAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryWriteUInt32(ctx, contextIdAddress, 1))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.driver_get_eq_context_id out=0x{contextIdAddress:X16} -> 1");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
     [SysAbiExport(
         Nid = "DL2RXaXOy88",
         ExportName = "sceAgcDriverDeleteEqEvent",
