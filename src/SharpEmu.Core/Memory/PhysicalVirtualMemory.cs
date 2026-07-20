@@ -837,6 +837,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private void ApplySegmentProtection(ulong mapStart, ulong mapEnd, ProgramHeaderFlags flags)
     {
+        // Loader segments can share one host allocation while carrying distinct
+        // per-page protections. Mark only those regions as requiring the slower
+        // page dictionary walk; ordinary data/GPU allocations retain their
+        // uniform region protection and can validate a bulk read in O(1).
+        var containingRegion = FindRegion(mapStart, mapEnd - mapStart);
+        if (containingRegion is not null)
+        {
+            containingRegion.HasPageProtectionOverrides = true;
+        }
+
         var runStart = mapStart;
         var runFlags = ProgramHeaderFlags.None;
         var hasRun = false;
@@ -1461,6 +1471,13 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private bool CanAccessWithoutProtectionChange(ulong address, ulong size, MemoryRegion region, bool write)
     {
+        if (!region.HasPageProtectionOverrides)
+        {
+            return write
+                ? IsWritableProtection(region.Protection)
+                : IsReadableProtection(region.Protection);
+        }
+
         var startPage = AlignDown(address, PageSize);
         var endPage = AlignUp(address + size, PageSize);
         for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
@@ -1652,6 +1669,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         public ulong Size { get; set; }
         public bool IsExecutable { get; set; }
         public bool IsReservedOnly { get; set; }
+        public bool HasPageProtectionOverrides { get; set; }
         public uint Protection { get; set; }
     }
 

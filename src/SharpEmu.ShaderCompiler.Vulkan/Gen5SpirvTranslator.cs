@@ -1743,6 +1743,8 @@ public static partial class Gen5SpirvTranslator
                 "SCbranchVccnz" => SubgroupAny(Load(_boolType, _vcc)),
                 "SCbranchExecz" => LogicalNot(SubgroupAny(Load(_boolType, _exec))),
                 "SCbranchExecnz" => SubgroupAny(Load(_boolType, _exec)),
+                // The emulator never runs shaders under the GPU system debugger.
+                "SCbranchCdbgsys" => _module.ConstantBool(false),
                 _ => 0,
             };
             return condition != 0;
@@ -1756,6 +1758,8 @@ public static partial class Gen5SpirvTranslator
             if (instruction.Opcode is
                 "SNop" or
                 "SWaitcnt" or
+                "SWaitcntVscnt" or
+                "SWaitcntVmcnt" or
                 "SInstPrefetch" or
                 "STtraceData" or
                 // NGG shaders bracket their exports with s_sendmsg
@@ -1847,7 +1851,9 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (control.Gds)
+            // BPERMUTE is a wave-lane shuffle and does not access LDS/GDS.
+            // Some PS5 shaders leave the otherwise irrelevant GDS bit set.
+            if (control.Gds && instruction.Opcode != "DsBpermuteB32")
             {
                 error = "GDS data share is not implemented";
                 return false;
@@ -1944,6 +1950,50 @@ public static partial class Gen5SpirvTranslator
                     var value = Load(
                         _uintType,
                         LdsPointer(address, control.Offset0));
+                    StoreV(instruction.Destinations[0].Value, value);
+                    return true;
+                }
+                case "DsReadB64":
+                {
+                    if (instruction.Destinations.Count < 2 ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read64 operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    StoreV(
+                        instruction.Destinations[0].Value,
+                        Load(_uintType, LdsPointer(address, control.Offset0)));
+                    StoreV(
+                        instruction.Destinations[1].Value,
+                        Load(
+                            _uintType,
+                            LdsPointer(address, control.Offset0 + sizeof(uint))));
+                    return true;
+                }
+                case "DsBpermuteB32":
+                {
+                    if (instruction.Destinations.Count < 1 ||
+                        instruction.Sources.Count < 2)
+                    {
+                        error = "missing DS bpermute operand";
+                        return false;
+                    }
+
+                    // DS_BPERMUTE_B32 gathers DATA0 from the wave lane selected
+                    // by VADDR (a byte address). PS5 waves execute as Vulkan
+                    // subgroups here, so this maps directly to subgroup shuffle.
+                    var sourceLane = BitwiseAnd(
+                        ShiftRightLogical(GetRawSource(instruction, 0), UInt(2)),
+                        UInt(31));
+                    var value = _module.AddInstruction(
+                        SpirvOp.GroupNonUniformShuffle,
+                        _uintType,
+                        UInt(3),
+                        GetRawSource(instruction, 1),
+                        sourceLane);
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
@@ -5006,6 +5056,13 @@ public static partial class Gen5SpirvTranslator
                 _vectorRegisters,
                 UInt(register));
 
+        private uint VectorPointerDynamic(uint register) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _vectorRegisters,
+                register);
+
         private uint PackedHalfPointer(uint register) =>
             _module.AddInstruction(
                 SpirvOp.AccessChain,
@@ -5402,7 +5459,8 @@ public static partial class Gen5SpirvTranslator
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
-                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32");
+                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32" or
+                    "DsBpermuteB32");
 
         private bool UsesSubgroupBroadcast() =>
             _state.Program.Instructions.Any(instruction =>

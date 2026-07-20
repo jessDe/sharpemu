@@ -108,6 +108,54 @@ public sealed class KernelPathCaseSensitivityTests : IDisposable
         Assert.False(File.Exists(resolved));
     }
 
+    [Fact]
+    public void App0MissingSystemFont_UsesTitleJapaneseFontFallback()
+    {
+        var app0Root = Path.Combine(_tempRoot, "font-fallback-app0");
+        var fontDirectory = Path.Combine(app0Root, "data", "common", "font");
+        Directory.CreateDirectory(fontDirectory);
+        var fallbackPath = Path.Combine(fontDirectory, "LevelNameFont_JP.otf");
+        File.WriteAllBytes(fallbackPath, [0x4F, 0x54, 0x54, 0x4F]);
+        KernelMemoryCompatExports.RegisterGuestPathMount("/app0", app0Root);
+
+        var resolved = KernelMemoryCompatExports.ResolveGuestPath(
+            "/app0/data/common/font/SIE-ShinGoPr6N-Heavy.otf");
+
+        Assert.Equal(fallbackPath, resolved);
+    }
+
+    [Fact]
+    public void App0MissingDeclaredFontWeight_UsesShippedFamilyFallback()
+    {
+        var app0Root = Path.Combine(_tempRoot, "font-weight-fallback-app0");
+        var fontDirectory = Path.Combine(app0Root, "data", "common", "font");
+        Directory.CreateDirectory(fontDirectory);
+        var fallbackPath = Path.Combine(fontDirectory, "FuturaStd-Bold.otf");
+        File.WriteAllBytes(fallbackPath, [0x4F, 0x54, 0x54, 0x4F]);
+        KernelMemoryCompatExports.RegisterGuestPathMount("/app0", app0Root);
+
+        var resolved = KernelMemoryCompatExports.ResolveGuestPath(
+            "/app0/data/common/font/FuturaStd-Medium.otf");
+
+        Assert.Equal(fallbackPath, resolved);
+    }
+
+    [Fact]
+    public void App0UnrelatedMissingFont_RemainsMissing()
+    {
+        var app0Root = Path.Combine(_tempRoot, "font-no-fallback-app0");
+        var fontDirectory = Path.Combine(app0Root, "data", "common", "font");
+        Directory.CreateDirectory(fontDirectory);
+        File.WriteAllBytes(Path.Combine(fontDirectory, "LevelNameFont_JP.otf"), [0x4F, 0x54, 0x54, 0x4F]);
+        KernelMemoryCompatExports.RegisterGuestPathMount("/app0", app0Root);
+
+        var resolved = KernelMemoryCompatExports.ResolveGuestPath(
+            "/app0/data/common/font/UnrelatedMissingFont.otf");
+
+        Assert.False(File.Exists(resolved));
+        Assert.EndsWith("UnrelatedMissingFont.otf", resolved, StringComparison.Ordinal);
+    }
+
     private bool HostFsIsCaseSensitive()
     {
         var name = $"probe_{Guid.NewGuid():N}";

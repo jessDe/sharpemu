@@ -12,6 +12,32 @@ public sealed class Gen5ShaderTranslatorTests
 {
     private const ulong ProgramAddress = 0x1_0000_0000;
 
+    [Fact]
+    public void SWqmB32DecodesWorldMapExecExpansion()
+    {
+        var memory = new FakeCpuMemory(ProgramAddress, 0x100);
+        Span<byte> code = stackalloc byte[2 * sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(code, 0xBEFE097Eu);
+        BinaryPrimitives.WriteUInt32LittleEndian(code[sizeof(uint)..], 0xBF810000u);
+        Assert.True(memory.TryWrite(ProgramAddress, code));
+
+        var context = new CpuContext(memory, Generation.Gen5);
+        Assert.True(
+            Gen5ShaderTranslator.TryDecodeProgram(
+                context,
+                ProgramAddress,
+                out var program,
+                out var error),
+            error);
+
+        var instruction = Assert.Single(
+            program.Instructions,
+            static item => item.Opcode == "SWqmB32");
+        Assert.Equal(Gen5ShaderEncoding.Sop1, instruction.Encoding);
+        Assert.Equal(126u, Assert.Single(instruction.Destinations).Value);
+        Assert.Equal(126u, Assert.Single(instruction.Sources).Value);
+    }
+
     [Theory]
     [InlineData(0xD7600005u, 5u)]
     [InlineData(0xD7600065u, 101u)]

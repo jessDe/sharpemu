@@ -74,6 +74,15 @@ public static class Gen5ShaderScalarEvaluator
     public static long GlobalMemoryReadLibcBytes;
     public static long GlobalMemoryReadReuses;
 
+    // Pixel and export shader evaluation for one draw is a single logical
+    // resource snapshot. Sharing exact address/size reads inside that scope
+    // avoids copying the same multi-megabyte scene arena once per stage while
+    // ensuring no array is shared with a later queued draw.
+    [ThreadStatic]
+    private static Dictionary<
+        (ulong BaseAddress, int RequestedLength),
+        (byte[] Data, int DataLength)>? _globalMemoryReadScope;
+
     private const ulong RdnaWaveMask = 0xFFFF_FFFFUL;
 
     static Gen5ShaderScalarEvaluator()
@@ -298,6 +307,14 @@ public static class Gen5ShaderScalarEvaluator
 
                 continue;
             }
+
+                // Async VM/VS counters are an ISA scheduling detail. Guest
+                // memory operations are emitted in program order by the host
+                // shader, so no scalar state changes are required here.
+                if (instruction.Opcode is "SWaitcntVscnt" or "SWaitcntVmcnt")
+                {
+                    continue;
+                }
 
                 if (instruction.Encoding is
                 Gen5ShaderEncoding.Sop1 or
@@ -983,10 +1000,14 @@ public static class Gen5ShaderScalarEvaluator
     // presenter, which returns it to the pool after the host-buffer upload.
     public static void BeginGlobalMemoryReadScope()
     {
+        _globalMemoryReadScope = new Dictionary<
+            (ulong BaseAddress, int RequestedLength),
+            (byte[] Data, int DataLength)>();
     }
 
     public static void EndGlobalMemoryReadScope()
     {
+        _globalMemoryReadScope = null;
     }
     private static bool TryReadGlobalMemory(
         CpuContext ctx,
@@ -994,6 +1015,17 @@ public static class Gen5ShaderScalarEvaluator
         out byte[] data,
         out int dataLength)
     {
+        var cacheKey = (baseAddress, MaxGlobalMemoryBindingBytes);
+        var cache = _globalMemoryReadScope;
+        if (cache is not null &&
+            cache.TryGetValue(cacheKey, out var cached))
+        {
+            Interlocked.Increment(ref GlobalMemoryReadCacheHits);
+            data = cached.Data;
+            dataLength = cached.DataLength;
+            return true;
+        }
+
         var rented = GlobalMemoryPool.Rent(MaxGlobalMemoryBindingBytes);
         for (var size = MaxGlobalMemoryBindingBytes; size >= 4096; size >>= 1)
         {
@@ -1004,6 +1036,7 @@ public static class Gen5ShaderScalarEvaluator
                 Interlocked.Add(ref GlobalMemoryReadPvmBytes, size);
                 data = rented;
                 dataLength = size;
+                cache?.TryAdd(cacheKey, (data, dataLength));
                 return true;
             }
         }
@@ -1034,6 +1067,17 @@ public static class Gen5ShaderScalarEvaluator
             return false;
         }
 
+        var cacheKey = (baseAddress, (int)cappedSize);
+        var cache = _globalMemoryReadScope;
+        if (cache is not null &&
+            cache.TryGetValue(cacheKey, out var cached))
+        {
+            Interlocked.Increment(ref GlobalMemoryReadCacheHits);
+            data = cached.Data;
+            dataLength = cached.DataLength;
+            return true;
+        }
+
         var rented = GlobalMemoryPool.Rent(
             Math.Max((int)cappedSize, sizeof(uint)));
         if (cappedSize < sizeof(uint))
@@ -1055,6 +1099,7 @@ public static class Gen5ShaderScalarEvaluator
                 }
                 data = rented;
                 dataLength = sizeof(uint);
+                cache?.TryAdd(cacheKey, (data, dataLength));
                 return true;
             }
 
@@ -1081,6 +1126,7 @@ public static class Gen5ShaderScalarEvaluator
                 }
                 data = rented;
                 dataLength = candidateSize;
+                cache?.TryAdd(cacheKey, (data, dataLength));
                 return true;
             }
 
@@ -1330,24 +1376,56 @@ public static class Gen5ShaderScalarEvaluator
         if (instruction.Opcode == "SMovB32")
         {
             registers[destination.Value] = left;
+            if (destination.Value == 126)
+            {
+                execMask = left;
+            }
             return true;
         }
 
         if (instruction.Opcode is
             "SNotB32" or
+            "SWqmB32" or
             "SBrevB32" or
             "SBcnt1I32B32" or
             "SFF1I32B32" or
+            "SFF1I32B64" or
             "SBitset1B32")
         {
-            registers[destination.Value] = instruction.Opcode switch
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                if (!TryEvaluateScalarOperand64(
+                        instruction.Sources[0],
+                        registers,
+                        execMask,
+                        out var wide))
+                {
+                    error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                    return false;
+                }
+
+                registers[destination.Value] = wide == 0
+                    ? uint.MaxValue
+                    : (uint)BitOperations.TrailingZeroCount(wide);
+                scalarConditionCode = registers[destination.Value] != 0;
+                return true;
+            }
+
+            var unaryResult = instruction.Opcode switch
             {
                 "SNotB32" => ~left,
+                "SWqmB32" =>
+                    ((left | (left >> 1) | (left >> 2) | (left >> 3)) & 0x1111_1111u) * 0xFu,
                 "SBrevB32" => ReverseBits(left),
                 "SBcnt1I32B32" => (uint)BitOperations.PopCount(left),
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
                 _ => registers[destination.Value] | (1u << ((int)left & 31)),
             };
+            registers[destination.Value] = unaryResult;
+            if (destination.Value == 126)
+            {
+                execMask = unaryResult;
+            }
             if (instruction.Opcode != "SBitset1B32")
             {
                 scalarConditionCode = registers[destination.Value] != 0;
@@ -1755,6 +1833,21 @@ public static class Gen5ShaderScalarEvaluator
             var bit = (int)(right & 63u);
             var isSet = ((wide >> bit) & 1UL) != 0;
             scalarConditionCode = instruction.Opcode == "SBitcmp1B64" ? isSet : !isSet;
+            return true;
+        }
+
+        if (instruction.Opcode == "SCmpLgU64")
+        {
+            if (!TryEvaluateScalarOperand64(
+                    instruction.Sources[0], registers, ulong.MaxValue, out var wideLeft) ||
+                !TryEvaluateScalarOperand64(
+                    instruction.Sources[1], registers, ulong.MaxValue, out var wideRight))
+            {
+                error = $"scalar-compare-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            scalarConditionCode = wideLeft != wideRight;
             return true;
         }
 

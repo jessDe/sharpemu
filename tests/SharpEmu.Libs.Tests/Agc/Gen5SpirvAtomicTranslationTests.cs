@@ -52,6 +52,24 @@ public sealed class Gen5SpirvAtomicTranslationTests
     }
 
     [Fact]
+    public void MissingGameplayInstructions_EmitSignedExtractShuffleAndLdsLoads()
+    {
+        var vopSources = 0x100u | (0x101u << 9) | (0x102u << 18);
+        var opcodes = CompileCompute(
+            [
+                0xD1490003, vopSources,       // V_BFE_I32 v3, v0, v1, v2
+                0xD8FA0000, 0x03000201,      // DS_BPERMUTE_B32 v3, v1, v2, ignored GDS bit
+                0xD9D80000, 0x03000001,      // DS_READ_B64 v[3:4], v1
+                0xBBFF0000,                  // S_WAITCNT_VMCNT null, 0
+            ],
+            new Dictionary<uint, uint>());
+
+        Assert.Contains((ushort)SpirvOp.BitFieldSExtract, opcodes);
+        Assert.Contains((ushort)SpirvOp.GroupNonUniformShuffle, opcodes);
+        Assert.Contains((ushort)SpirvOp.Load, opcodes);
+    }
+
+    [Fact]
     public void ImageAtomicAdd_EmitsTexelPointerAndAtomicAdd()
     {
         // IMAGE_ATOMIC_ADD v2, v[0:1], s[4:11] dmask:0x1 dim:2D glc against an R32ui T#.
@@ -65,6 +83,37 @@ public sealed class Gen5SpirvAtomicTranslationTests
 
         Assert.Contains((ushort)SpirvOp.ImageTexelPointer, opcodes);
         Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
+    }
+
+    [Fact]
+    public void FmaMixAndSystemDebugBranch_CompileToSpirv()
+    {
+        // The debug branch falls through in normal execution. V_FMA_MIX_F32
+        // selects mixed f32/f16 inputs and applies ABS/NEG source modifiers.
+        var sources = 0x100u | (0x101u << 9) | (0x102u << 18) | (5u << 29);
+        var opcodes = CompileCompute(
+            [
+                0xBF970000,            // S_CBRANCH_CDBGSYS +0
+                0xCC204A03, sources,   // V_FMA_MIX_F32 v3, v0, v1, v2
+            ],
+            new Dictionary<uint, uint>());
+
+        Assert.Contains((ushort)SpirvOp.ExtInst, opcodes);
+        Assert.Contains((ushort)SpirvOp.BitwiseAnd, opcodes);
+        Assert.Contains((ushort)SpirvOp.FNegate, opcodes);
+    }
+
+    [Fact]
+    public void WorldMapWholeQuadMaskCompilesToSpirv()
+    {
+        // S_WQM_B32 exec_lo, exec_lo. ASTRO BOT uses this exact word in its
+        // first world-map pixel shader to enable all lanes of each active quad.
+        var opcodes = CompileCompute(
+            [0xBEFE097E],
+            new Dictionary<uint, uint>());
+
+        Assert.Contains((ushort)SpirvOp.BitwiseOr, opcodes);
+        Assert.Contains((ushort)SpirvOp.IMul, opcodes);
     }
 
     private static Dictionary<uint, uint> BufferDescriptorRegisters() => new()

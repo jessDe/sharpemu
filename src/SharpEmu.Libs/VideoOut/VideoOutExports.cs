@@ -5,7 +5,9 @@ using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Audio;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.ShaderCompiler;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
@@ -1276,10 +1278,38 @@ public static class VideoOutExports
         var submitted = Interlocked.Exchange(ref _submittedFrameCount, 0);
         var presentedCount = Interlocked.Exchange(ref _presentedFrameCount, 0);
         var (draws, drawMs, pipelines, spirvCompiles) = GuestGpu.Current.ReadAndResetPerfCounters();
+        var guestReads = Interlocked.Exchange(
+            ref Gen5ShaderScalarEvaluator.GlobalMemoryReadCount,
+            0);
+        var guestReadBytes = Interlocked.Exchange(
+            ref Gen5ShaderScalarEvaluator.GlobalMemoryReadBytes,
+            0);
+        var guestPvmBytes = Interlocked.Exchange(
+            ref Gen5ShaderScalarEvaluator.GlobalMemoryReadPvmBytes,
+            0);
+        var guestLibcBytes = Interlocked.Exchange(
+            ref Gen5ShaderScalarEvaluator.GlobalMemoryReadLibcBytes,
+            0);
+        var (shaderEvaluations, shaderEvaluationMs) =
+            AgcExports.ReadAndResetShaderEvaluationPerf();
+        var (commandParses, commandParseMs, commandReadMs, commandCoreMs) =
+            AgcExports.ReadAndResetCommandParsePerf();
+        var (drawTranslations, drawTranslationMs) =
+            AgcExports.ReadAndResetDrawTranslationPerf();
+        var (computeDispatches, computeDispatchMs) =
+            AgcExports.ReadAndResetComputeDispatchPerf();
         Console.Error.WriteLine(
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
-            $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles}");
+            $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
+            $"guest_reads={guestReads} guest_read_mb={guestReadBytes / (1024.0 * 1024.0):F1} " +
+            $"pvm_mb={guestPvmBytes / (1024.0 * 1024.0):F1} " +
+            $"libc_mb={guestLibcBytes / (1024.0 * 1024.0):F1} " +
+            $"shader_evals={shaderEvaluations} shader_eval_ms={shaderEvaluationMs:F0} " +
+            $"draw_translations={drawTranslations} draw_translation_ms={drawTranslationMs:F0} " +
+            $"compute_dispatches={computeDispatches} compute_dispatch_ms={computeDispatchMs:F0} " +
+            $"command_parses={commandParses} command_parse_ms={commandParseMs:F0} " +
+            $"command_read_ms={commandReadMs:F0} command_core_ms={commandCoreMs:F0}");
     }
 
     private static readonly bool _flipPacingDisabled = string.Equals(

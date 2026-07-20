@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using System.Collections.Concurrent;
 
 namespace SharpEmu.Libs.Np;
 
@@ -10,6 +11,8 @@ public static class NpWebApi2Exports
     private const int NpWebApi2ErrorInvalidArgument = unchecked((int)0x80553402);
 
     private static int _initialized;
+    private static int _nextUserContextId;
+    private static readonly ConcurrentDictionary<(int LibraryContextId, int UserId), int> UserContexts = new();
 
     [SysAbiExport(
         Nid = "+o9816YQhqQ",
@@ -50,10 +53,19 @@ public static class NpWebApi2Exports
         LibraryName = "libSceNpWebApi2")]
     public static int NpWebApi2CreateUserContext(CpuContext ctx)
     {
-        // No PSN backend: refuse user-context creation so the title's online
-        // layer backs off instead of driving a half-created context handle.
-        TraceNpWebApi2("create-user-context", unchecked((int)ctx[CpuRegister.Rdi]), ctx[CpuRegister.Rsi]);
-        return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var userId = unchecked((int)ctx[CpuRegister.Rsi]);
+
+        // A user context is only a local routing handle. It is safe to provide
+        // one without a PSN backend; individual online requests can still report
+        // their offline result. Returning INVALID_ARGUMENT here makes titles
+        // retry context creation every frame and prevents offline startup.
+        var userContextId = UserContexts.GetOrAdd(
+            (libraryContextId, userId),
+            static _ => Interlocked.Increment(ref _nextUserContextId));
+        Interlocked.Exchange(ref _initialized, 1);
+        TraceNpWebApi2("create-user-context", libraryContextId, unchecked((uint)userId));
+        return ctx.SetReturn(userContextId);
     }
 
     [SysAbiExport(
@@ -65,6 +77,7 @@ public static class NpWebApi2Exports
     {
         var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
         Interlocked.Exchange(ref _initialized, 0);
+        UserContexts.Clear();
         TraceNpWebApi2("term", libraryContextId, 0);
         return ctx.SetReturn(0);
     }

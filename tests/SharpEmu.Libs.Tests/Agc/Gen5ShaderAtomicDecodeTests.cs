@@ -103,6 +103,92 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
     }
 
+    [Fact]
+    public void DsBpermuteB32_HasLaneAddressDataAndDestination()
+    {
+        // DS_BPERMUTE_B32 v3, v1, v2
+        var instruction = DecodeSingle(0xD8F80000, 0x03000201);
+
+        Assert.Equal("DsBpermuteB32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
+    }
+
+    [Fact]
+    public void DsReadB64_WritesTwoDestinationRegisters()
+    {
+        // DS_READ_B64 v[3:4], v1
+        var instruction = DecodeSingle(0xD9D80000, 0x03000001);
+
+        Assert.Equal("DsReadB64", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(1) }, instruction.Sources);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(3), Gen5Operand.Vector(4) },
+            instruction.Destinations);
+    }
+
+    [Fact]
+    public void VBfeI32_DecodesSignedBitFieldExtract()
+    {
+        var sources = 0x100u | (0x101u << 9) | (0x102u << 18);
+        var instruction = DecodeSingle(0xD1490003, sources);
+
+        Assert.Equal("VBfeI32", instruction.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            instruction.Sources);
+    }
+
+    [Fact]
+    public void SWaitcntVmcnt_DecodesWithoutScalarDestination()
+    {
+        var instruction = DecodeSingle(0xBBFF0000);
+
+        Assert.Equal("SWaitcntVmcnt", instruction.Opcode);
+        Assert.Empty(instruction.Destinations);
+    }
+
+    [Fact]
+    public void MissingAstroScalarAndRelativeOpcodes_Decode()
+    {
+        var ff1B64 = DecodeSingle(0xBEEB147E);
+        Assert.Equal("SFF1I32B64", ff1B64.Opcode);
+
+        // SOPC op 0x13, s[0:1] != s[2:3].
+        var compare64 = DecodeSingle(0xBF130200);
+        Assert.Equal("SCmpLgU64", compare64.Opcode);
+
+        // V_MOVRELS_B32 v3, v2 (source register is offset by M0).
+        var movrels = DecodeSingle(0x7E068702);
+        Assert.Equal("VMovrelsB32", movrels.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(2) }, movrels.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, movrels.Destinations);
+    }
+
+    [Fact]
+    public void AstroSceneShaderOpcodes_DecodeWithCorrectVop3pModifiers()
+    {
+        // SOPP op 0x17 is S_CBRANCH_CDBGSYS on GFX10. The condition is false
+        // during normal (non-debugger) shader execution.
+        var debugBranch = DecodeSingle(0xBF970000);
+        Assert.Equal("SCbranchCdbgsys", debugBranch.Opcode);
+
+        // V_FMA_MIX_F32 v3, v0, v1, v2 with distinct low/high negate masks.
+        var sources = 0x100u | (0x101u << 9) | (0x102u << 18) | (5u << 29);
+        var fmaMix = DecodeSingle(0xCC200203, sources);
+        Assert.Equal("VFmaMixF32", fmaMix.Opcode);
+        var control = Assert.IsType<Gen5Vop3pControl>(fmaMix.Control);
+        Assert.Equal(2u, control.NegLoMask);
+        Assert.Equal(5u, control.NegHiMask);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, fmaMix.Destinations);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            fmaMix.Sources);
+    }
+
     private static Gen5ShaderInstruction DecodeSingle(params uint[] words)
     {
         var memory = new FakeCpuMemory(ShaderAddress, 0x1000);

@@ -30,4 +30,28 @@ public sealed class PadExportsTests
         _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
         Assert.Equal(expected, PadExports.PadSetTiltCorrectionState(_ctx));
     }
+
+    [Fact]
+    public void GetTriggerEffectState_WritesTwoNeutralModes()
+    {
+        const ulong address = Base + 0x100;
+        Assert.True(_memory.TryWrite(address, new byte[] { 0xAA, 0xBB, 0xCC }));
+        _ctx[CpuRegister.Rdi] = 1;
+        _ctx[CpuRegister.Rsi] = address;
+
+        Assert.Equal(0, PadExports.PadGetTriggerEffectState(_ctx));
+
+        Span<byte> actual = stackalloc byte[3];
+        Assert.True(_memory.TryRead(address, actual));
+        Assert.Equal(new byte[] { 0, 0, 0xCC }, actual.ToArray());
+    }
+
+    [Fact]
+    public void GetTriggerEffectState_ValidatesHandle()
+    {
+        _ctx[CpuRegister.Rdi] = 2;
+        _ctx[CpuRegister.Rsi] = Base + 0x100;
+
+        Assert.Equal(InvalidHandle, PadExports.PadGetTriggerEffectState(_ctx));
+    }
 }

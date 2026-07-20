@@ -19,13 +19,9 @@ public sealed class AvPlayerStreamInfoTests
     private const byte Sentinel = 0xAB;
 
     [Theory]
-    [InlineData(false, 0u)]
-    [InlineData(true, 0u)]
-    [InlineData(false, 1u)]
-    [InlineData(true, 1u)]
-    public void GetStreamInfoFunctionsDoNotWritePastThe32ByteStructure(
-        bool useExtendedFunction,
-        uint streamIndex)
+    [InlineData(0u)]
+    [InlineData(1u)]
+    public void GetStreamInfoExDoesNotWritePastThe32ByteStructure(uint streamIndex)
     {
         var memory = new FakeCpuMemory(BaseAddress, MemorySize);
         var context = new CpuContext(memory, Generation.Gen5);
@@ -41,9 +37,7 @@ public sealed class AvPlayerStreamInfoTests
             context[CpuRegister.Rsi] = streamIndex;
             context[CpuRegister.Rdx] = InfoAddress;
 
-            var resultCode = useExtendedFunction
-                ? AvPlayerExports.AvPlayerGetStreamInfoEx(context)
-                : AvPlayerExports.AvPlayerGetStreamInfo(context);
+            var resultCode = AvPlayerExports.AvPlayerGetStreamInfoEx(context);
             Assert.Equal(0, resultCode);
 
             Span<byte> result = stackalloc byte[40];
@@ -123,4 +117,51 @@ public sealed class AvPlayerStreamInfoTests
         useExtendedFunction
             ? AvPlayerExports.AvPlayerGetStreamInfoEx(context)
             : AvPlayerExports.AvPlayerGetStreamInfo(context);
+
+    [Theory]
+    [InlineData(0, 1, 3840, 2160)]
+    [InlineData(1, 2, 2, 48000)]
+    public void WriteStreamInfo_UsesSixteenByteAbiWithoutClobberingCallerStack(
+        uint streamIndex,
+        uint expectedType,
+        uint expectedFirstValue,
+        uint expectedSecondValue)
+    {
+        var memory = new FakeCpuMemory(BaseAddress, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        const ulong sentinel = 0xD15EA5E5CAFEBABE;
+        Span<byte> sentinelBytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(sentinelBytes, sentinel);
+        Assert.True(memory.TryWrite(InfoAddress + 16, sentinelBytes));
+
+        Assert.True(AvPlayerExports.TryWriteStreamInfo(
+            context,
+            InfoAddress,
+            streamIndex,
+            3840,
+            2160));
+
+        Span<byte> result = stackalloc byte[24];
+        Assert.True(memory.TryRead(InfoAddress, result));
+        Assert.Equal(expectedType, BinaryPrimitives.ReadUInt32LittleEndian(result));
+        Assert.Equal(expectedFirstValue, BinaryPrimitives.ReadUInt32LittleEndian(result[8..]));
+        Assert.Equal(expectedSecondValue, BinaryPrimitives.ReadUInt32LittleEndian(result[12..]));
+        Assert.Equal(sentinel, BinaryPrimitives.ReadUInt64LittleEndian(result[16..]));
+    }
+
+    [Theory]
+    [InlineData(3840, 2160, 1280, 1280, 720)]
+    [InlineData(1920, 1080, 1280, 1280, 720)]
+    [InlineData(640, 481, 1280, 640, 480)]
+    public void ComputeHostPreviewSize_PreservesAspectAndProducesEvenHeight(
+        int sourceWidth,
+        int sourceHeight,
+        int maximumWidth,
+        int expectedWidth,
+        int expectedHeight)
+    {
+        Assert.Equal(
+            (expectedWidth, expectedHeight),
+            AvPlayerExports.ComputeHostPreviewSize(sourceWidth, sourceHeight, maximumWidth));
+    }
 }

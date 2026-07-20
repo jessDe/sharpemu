@@ -291,6 +291,85 @@ public static partial class KernelMemoryCompatExports
         return true;
     }
 
+    /// <summary>
+    /// Allocates an HLE-owned guest range backed by PS5 direct memory. Use this
+    /// for compatibility buffers that the guest will expose as GPU resources;
+    /// ordinary HLE data should continue to use <see cref="TryAllocateHleData"/>.
+    /// </summary>
+    internal static bool TryAllocateHleDirectData(
+        CpuContext ctx,
+        ulong length,
+        ulong alignment,
+        int memoryType,
+        out ulong address)
+    {
+        address = 0;
+        if (length == 0 || length > int.MaxValue)
+        {
+            return false;
+        }
+
+        var mappedLength = AlignUp(length, OrbisPageSize);
+        var effectiveAlignment = Math.Max(alignment, OrbisPageSize);
+        const int protection =
+            OrbisProtCpuReadWrite | OrbisProtGpuRead | OrbisProtGpuWrite;
+        ulong directStart;
+        lock (_memoryGate)
+        {
+            if (!TryAllocateDirectMemoryLocked(
+                    0,
+                    DirectMemorySizeBytes,
+                    mappedLength,
+                    effectiveAlignment,
+                    memoryType,
+                    DirectMemorySizeBytes,
+                    out directStart))
+            {
+                return false;
+            }
+
+            var desiredAddress = AlignUp(
+                _nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress,
+                effectiveAlignment);
+            if (!TryReserveGuestVirtualRange(
+                    ctx,
+                    desiredAddress,
+                    mappedLength,
+                    protection,
+                    effectiveAlignment,
+                    out address) ||
+                address == 0)
+            {
+                _ = TryReleaseDirectMemoryRangeLocked(directStart, mappedLength);
+                address = 0;
+                return false;
+            }
+
+            _nextVirtualAddress = Math.Max(_nextVirtualAddress, address + mappedLength);
+            _mappedRegions[address] = new MappedRegion(
+                address,
+                mappedLength,
+                protection,
+                IsFlexible: false,
+                IsDirect: true,
+                DirectStart: directStart);
+        }
+
+        for (ulong offset = 0; offset < mappedLength;)
+        {
+            var chunkLength = (int)Math.Min((ulong)_zeroChunk.Length, mappedLength - offset);
+            if (!ctx.Memory.TryWrite(address + offset, _zeroChunk.AsSpan(0, chunkLength)))
+            {
+                return false;
+            }
+
+            offset += (ulong)chunkLength;
+        }
+
+        GuestWriteWatch.OnDirectMapping(address, mappedLength, protection);
+        return true;
+    }
+
     internal static void RegisterReservedVirtualRange(ulong address, ulong length)
     {
         if (address == 0 || length == 0)
@@ -1371,22 +1450,32 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        Span<byte> leftByte = stackalloc byte[1];
-        Span<byte> rightByte = stackalloc byte[1];
-        for (var i = 0; i < count; i++)
+        Span<byte> leftBytes = stackalloc byte[256];
+        Span<byte> rightBytes = stackalloc byte[256];
+        for (var offset = 0; offset < count;)
         {
-            if (!TryReadCompat(ctx, left + (ulong)i, leftByte) ||
-                !TryReadCompat(ctx, right + (ulong)i, rightByte))
+            var chunkLength = Math.Min(
+                GetGuestScanChunkLength(left + (ulong)offset, count - offset),
+                GetGuestScanChunkLength(right + (ulong)offset, count - offset));
+            var leftChunk = leftBytes[..chunkLength];
+            var rightChunk = rightBytes[..chunkLength];
+            if (!TryReadCompat(ctx, left + (ulong)offset, leftChunk) ||
+                !TryReadCompat(ctx, right + (ulong)offset, rightChunk))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            var diff = leftByte[0] - rightByte[0];
-            if (diff != 0)
+            for (var index = 0; index < chunkLength; index++)
             {
-                ctx[CpuRegister.Rax] = unchecked((ulong)diff);
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                var diff = leftChunk[index] - rightChunk[index];
+                if (diff != 0)
+                {
+                    ctx[CpuRegister.Rax] = unchecked((ulong)diff);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
             }
+
+            offset += chunkLength;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -3328,6 +3417,41 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "mkgXxsoxWHg",
+        ExportName = "sceKernelClearVirtualRangeName",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelClearVirtualRangeName(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rdi];
+        var length = ctx[CpuRegister.Rsi];
+        if (address == 0 || length == 0 || ulong.MaxValue - address < length)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        lock (_memoryGate)
+        {
+            // Range names are associated with the containing virtual-query
+            // region, matching KernelSetVirtualRangeName above. Clearing an
+            // already unnamed valid range is still a successful idempotent
+            // cleanup operation, as games use this while destroying workers.
+            if (!TryFindVirtualQueryRegionLocked(address, findNext: false, out var region) ||
+                length > region.Length ||
+                address < region.Address ||
+                length > region.Address + region.Length - address)
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+
+            _mappedRegionNames.Remove(region.Address);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "rVjRvHJ0X6c",
         ExportName = "sceKernelVirtualQuery",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -4780,7 +4904,7 @@ public static partial class KernelMemoryCompatExports
 
         if (TryResolveRegisteredGuestMount(guestPath, out var mountedPath))
         {
-            return mountedPath;
+            return ResolveKnownMissingTitleAssetFallback(guestPath, mountedPath);
         }
 
         if (guestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase))
@@ -4874,13 +4998,15 @@ public static partial class KernelMemoryCompatExports
             if (guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["/app0/".Length..]);
-                return Path.Combine(app0Root, relative);
+                var resolvedPath = Path.Combine(app0Root, relative);
+                return ResolveKnownMissingTitleAssetFallback(guestPath, resolvedPath);
             }
 
             if (guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["app0/".Length..]);
-                return Path.Combine(app0Root, relative);
+                var resolvedPath = Path.Combine(app0Root, relative);
+                return ResolveKnownMissingTitleAssetFallback('/' + guestPath, resolvedPath);
             }
 
             if (!Path.IsPathFullyQualified(guestPath) &&
@@ -4893,6 +5019,57 @@ public static partial class KernelMemoryCompatExports
         }
 
         return guestPath;
+    }
+
+    // Some retail titles list system/licensed font weights in font_settings.xml
+    // without shipping every file in the extracted package. A real console can
+    // satisfy those dependencies from system content. Keep the workaround
+    // deliberately exact and local to the title's common font directory, and
+    // only substitute a compatible font which the title did ship.
+    private static string ResolveKnownMissingTitleAssetFallback(string guestPath, string resolvedPath)
+    {
+        if (File.Exists(resolvedPath))
+        {
+            return resolvedPath;
+        }
+
+        var normalizedGuestPath = guestPath.Replace('\\', '/');
+        const string fontDirectory = "/app0/data/common/font/";
+        if (!normalizedGuestPath.StartsWith(fontDirectory, StringComparison.OrdinalIgnoreCase) ||
+            normalizedGuestPath[fontDirectory.Length..].Contains('/'))
+        {
+            return resolvedPath;
+        }
+
+        var missingFont = normalizedGuestPath[fontDirectory.Length..];
+        var fallbackFont = missingFont.ToUpperInvariant() switch
+        {
+            "SIE-SHINGOPR6N-HEAVY.OTF" => "LevelNameFont_JP.otf",
+            "FUTURANOWTEXT-BD.OTF" => "FuturaNowText-XBd.otf",
+            "FUTURANOWTEXT-BLK.OTF" => "FuturaNowText-XBd.otf",
+            "FUTURASTD-BOOK.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-CONDENSED.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-CONDENSEDLIGHT.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-LIGHT.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-MEDIUM.OTF" => "FuturaStd-Bold.otf",
+            "HEISEIMARUGO.TTF" => "LevelNameFont_JP.otf",
+            "MOHR-LIGHTIT.OTF" => "LevelNameFont.otf",
+            _ => null,
+        };
+
+        if (fallbackFont is null)
+        {
+            return resolvedPath;
+        }
+
+        var directory = Path.GetDirectoryName(resolvedPath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return resolvedPath;
+        }
+
+        var fallbackPath = Path.Combine(directory, fallbackFont);
+        return File.Exists(fallbackPath) ? fallbackPath : resolvedPath;
     }
 
     private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
@@ -7365,24 +7542,32 @@ public static partial class KernelMemoryCompatExports
 
         // The terminator counts as part of the scanned range, so strchr(s, '\0')
         // returns a pointer to the string's null byte just like a native libc.
-        Span<byte> current = stackalloc byte[1];
-        for (ulong index = 0; index < 1_048_576; index++)
+        Span<byte> chunk = stackalloc byte[256];
+        for (ulong offset = 0; offset < 1_048_576;)
         {
-            if (!TryReadCompat(ctx, address + index, current))
+            var chunkLength = GetGuestScanChunkLength(
+                address + offset,
+                1_048_576 - checked((int)offset));
+            var current = chunk[..chunkLength];
+            if (!TryReadCompat(ctx, address + offset, current))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            if (current[0] == needle)
+            var needleIndex = current.IndexOf(needle);
+            var terminatorIndex = current.IndexOf((byte)0);
+            if (needleIndex >= 0 && (terminatorIndex < 0 || needleIndex <= terminatorIndex))
             {
-                ctx[CpuRegister.Rax] = address + index;
+                ctx[CpuRegister.Rax] = address + offset + (ulong)needleIndex;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
-            if (current[0] == 0)
+            if (terminatorIndex >= 0)
             {
                 break;
             }
+
+            offset += (ulong)chunkLength;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -7405,24 +7590,35 @@ public static partial class KernelMemoryCompatExports
 
         ulong match = 0;
         var found = false;
-        Span<byte> current = stackalloc byte[1];
-        for (ulong index = 0; index < 1_048_576; index++)
+        Span<byte> chunk = stackalloc byte[256];
+        for (ulong offset = 0; offset < 1_048_576;)
         {
-            if (!TryReadCompat(ctx, address + index, current))
+            var chunkLength = GetGuestScanChunkLength(
+                address + offset,
+                1_048_576 - checked((int)offset));
+            var current = chunk[..chunkLength];
+            if (!TryReadCompat(ctx, address + offset, current))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            if (current[0] == needle)
+            var terminatorIndex = current.IndexOf((byte)0);
+            var searchable = terminatorIndex >= 0
+                ? current[..(terminatorIndex + 1)]
+                : current;
+            var needleIndex = searchable.LastIndexOf(needle);
+            if (needleIndex >= 0)
             {
-                match = address + index;
+                match = address + offset + (ulong)needleIndex;
                 found = true;
             }
 
-            if (current[0] == 0)
+            if (terminatorIndex >= 0)
             {
                 break;
             }
+
+            offset += (ulong)chunkLength;
         }
 
         ctx[CpuRegister.Rax] = found ? match : 0;
@@ -7440,23 +7636,39 @@ public static partial class KernelMemoryCompatExports
         var needle = unchecked((byte)ctx[CpuRegister.Rsi]);
         var count = ctx[CpuRegister.Rdx];
 
-        Span<byte> current = stackalloc byte[1];
-        for (ulong index = 0; index < count; index++)
+        Span<byte> chunk = stackalloc byte[256];
+        for (ulong offset = 0; offset < count;)
         {
-            if (!TryReadCompat(ctx, address + index, current))
+            var remaining = count - offset;
+            var chunkLength = GetGuestScanChunkLength(
+                address + offset,
+                checked((int)Math.Min(remaining, int.MaxValue)));
+            var current = chunk[..chunkLength];
+            if (!TryReadCompat(ctx, address + offset, current))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            if (current[0] == needle)
+            var needleIndex = current.IndexOf(needle);
+            if (needleIndex >= 0)
             {
-                ctx[CpuRegister.Rax] = address + index;
+                ctx[CpuRegister.Rax] = address + offset + (ulong)needleIndex;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
+
+            offset += (ulong)chunkLength;
         }
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int GetGuestScanChunkLength(ulong address, int remaining)
+    {
+        const int chunkCapacity = 256;
+        const int pageSize = 4096;
+        var bytesToPageEnd = pageSize - (int)(address & (pageSize - 1));
+        return Math.Min(Math.Min(remaining, chunkCapacity), bytesToPageEnd);
     }
 
     [SysAbiExport(

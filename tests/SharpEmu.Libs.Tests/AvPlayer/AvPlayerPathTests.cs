@@ -186,6 +186,35 @@ public sealed class AvPlayerPathTests : IDisposable
         AssertPathIsInsideApp0(resolved);
     }
 
+    [Fact]
+    public void ExecutableLookupFindsPlatformBinaryOnPath()
+    {
+        var toolsDirectory = Path.Combine(_tempRoot, "tools");
+        Directory.CreateDirectory(toolsDirectory);
+        var executableName = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
+        var executablePath = Path.Combine(toolsDirectory, executableName);
+        File.WriteAllBytes(executablePath, [0x01]);
+
+        Assert.Equal(
+            Path.GetFullPath(executablePath),
+            AvPlayerExports.FindExecutableOnPath("ffmpeg", toolsDirectory));
+    }
+
+    [Fact]
+    public void SiblingToolLookupUsesPlatformExecutableSuffix()
+    {
+        var toolsDirectory = Path.Combine(_tempRoot, "sibling-tools");
+        Directory.CreateDirectory(toolsDirectory);
+        var ffmpegPath = Path.Combine(toolsDirectory, OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+        var ffprobePath = Path.Combine(toolsDirectory, OperatingSystem.IsWindows() ? "ffprobe.exe" : "ffprobe");
+        File.WriteAllBytes(ffmpegPath, [0x01]);
+        File.WriteAllBytes(ffprobePath, [0x01]);
+
+        Assert.Equal(
+            Path.GetFullPath(ffprobePath),
+            AvPlayerExports.FindSiblingExecutable(ffmpegPath, "ffprobe"));
+    }
+
     public void Dispose()
     {
         Environment.SetEnvironmentVariable("SHARPEMU_APP0_DIR", _originalApp0);

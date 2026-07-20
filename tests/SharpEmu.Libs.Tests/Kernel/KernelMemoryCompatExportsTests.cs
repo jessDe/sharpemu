@@ -161,6 +161,46 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
+    public void LibcScans_PreserveResultsAcrossChunksAndPageBoundaries()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong stringAddress = memoryBase + 0xF80;
+        const ulong leftAddress = memoryBase + 0x1800;
+        const ulong rightAddress = memoryBase + 0x1C00;
+        var memory = new FakeCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        var text = Enumerable.Repeat((byte)'a', 601).ToArray();
+        text[100] = (byte)'x';
+        text[400] = (byte)'x';
+        text[600] = 0;
+        Assert.True(memory.TryWrite(stringAddress, text));
+
+        context[CpuRegister.Rdi] = stringAddress;
+        context[CpuRegister.Rsi] = (byte)'x';
+        Assert.Equal(0, KernelMemoryCompatExports.Strchr(context));
+        Assert.Equal(stringAddress + 100, context[CpuRegister.Rax]);
+        Assert.Equal(0, KernelMemoryCompatExports.Strrchr(context));
+        Assert.Equal(stringAddress + 400, context[CpuRegister.Rax]);
+
+        context[CpuRegister.Rdx] = 500;
+        Assert.Equal(0, KernelMemoryCompatExports.Memchr(context));
+        Assert.Equal(stringAddress + 100, context[CpuRegister.Rax]);
+
+        var left = Enumerable.Repeat((byte)0x40, 600).ToArray();
+        var right = (byte[])left.Clone();
+        left[513] = 0x7F;
+        right[513] = 0x20;
+        Assert.True(memory.TryWrite(leftAddress, left));
+        Assert.True(memory.TryWrite(rightAddress, right));
+        context[CpuRegister.Rdi] = leftAddress;
+        context[CpuRegister.Rsi] = rightAddress;
+        context[CpuRegister.Rdx] = (ulong)left.Length;
+        Assert.Equal(0, KernelMemoryCompatExports.Memcmp(context));
+        Assert.Equal(0x5FUL, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
     public void AvailableDirectMemorySize_FragmentedRangeReturnsLargestAlignedSpan()
     {
         const ulong firstAllocationStart = 0x0020_0000;
@@ -345,6 +385,40 @@ public sealed class KernelMemoryCompatExportsTests
         context[CpuRegister.Rdx] = 0x03;
 
         var result = KernelMemoryCompatExports.KernelMprotect(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, result);
+    }
+
+    [Fact]
+    public void ClearVirtualRangeName_RegistersCrashNid()
+    {
+        var manager = new ModuleManager();
+        manager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
+
+        Assert.True(manager.TryGetExport("mkgXxsoxWHg", out var export));
+        Assert.Equal("sceKernelClearVirtualRangeName", export.Name);
+    }
+
+    [Fact]
+    public void ClearVirtualRangeName_RejectsInvalidRange()
+    {
+        var context = new CpuContext(new FakeCpuMemory(GuestMemoryBase, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = 0;
+        context[CpuRegister.Rsi] = 0x4000;
+
+        var result = KernelMemoryCompatExports.KernelClearVirtualRangeName(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT, result);
+    }
+
+    [Fact]
+    public void ClearVirtualRangeName_UnmappedRangeReturnsNotFound()
+    {
+        var context = new CpuContext(new FakeCpuMemory(GuestMemoryBase, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = 0x2_0000_0000;
+        context[CpuRegister.Rsi] = 0x4000;
+
+        var result = KernelMemoryCompatExports.KernelClearVirtualRangeName(context);
 
         Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, result);
     }

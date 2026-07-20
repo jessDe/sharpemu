@@ -47,6 +47,20 @@ public static partial class Gen5MslTranslator
 
             switch (instruction.Opcode)
             {
+                case "VMovrelsB32":
+                {
+                    if (instruction.Sources.Count == 0 ||
+                        instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+                    {
+                        error = "VMovrelsB32 expects a VGPR source";
+                        return false;
+                    }
+
+                    StoreVector(
+                        DestinationVector(instruction),
+                        $"v[({instruction.Sources[0].Value}u + s[124]) & 255u]");
+                    return true;
+                }
                 case "VReadfirstlaneB32":
                 {
                     if (instruction.Destinations.Count == 0 ||
@@ -272,6 +286,8 @@ public static partial class Gen5MslTranslator
                     AsUInt($"(as_type<int>({RawSource(instruction, 1)}) >> (({RawSource(instruction, 0)}) & 31u))"),
                 "VBfeU32" =>
                     $"extract_bits({RawSource(instruction, 0)}, ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)",
+                "VBfeI32" =>
+                    AsUInt($"extract_bits(as_type<int>({RawSource(instruction, 0)}), ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)"),
                 "VBfiB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | (~({RawSource(instruction, 0)}) & ({RawSource(instruction, 2)})))",
                 "VBfmB32" =>
@@ -952,6 +968,17 @@ public static partial class Gen5MslTranslator
                 return true;
             }
 
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                var source = Temp("ulong", RawSource64(instruction, 0));
+                var result = Temp(
+                    "uint",
+                    $"{source} == 0ul ? 0xFFFFFFFFu : (uint)ctz({source})");
+                StoreScalar(destination, result);
+                Line($"scc = {result} != 0u;");
+                return true;
+            }
+
             if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
                 instruction.Opcode is "SBfeU64" or "SBfeI64")
             {
@@ -1002,6 +1029,16 @@ public static partial class Gen5MslTranslator
                 case "SNotB32":
                 {
                     var result = Temp("uint", $"~{left}");
+                    StoreScalar(destination, result);
+                    Line($"scc = {result} != 0u;");
+                    return true;
+                }
+                case "SWqmB32":
+                {
+                    var quadAny = Temp(
+                        "uint",
+                        $"({left} | ({left} >> 1) | ({left} >> 2) | ({left} >> 3)) & 0x11111111u");
+                    var result = Temp("uint", $"{quadAny} * 0xFu");
                     StoreScalar(destination, result);
                     Line($"scc = {result} != 0u;");
                     return true;
@@ -1225,6 +1262,12 @@ public static partial class Gen5MslTranslator
             {
                 error = "missing scalar compare source";
                 return false;
+            }
+
+            if (instruction.Opcode == "SCmpLgU64")
+            {
+                Line($"scc = ({RawSource64(instruction, 0)}) != ({RawSource64(instruction, 1)});");
+                return true;
             }
 
             var left = Temp("uint", RawSource(instruction, 0));

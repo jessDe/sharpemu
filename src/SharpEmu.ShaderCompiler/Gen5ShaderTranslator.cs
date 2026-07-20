@@ -691,10 +691,12 @@ public static class Gen5ShaderTranslator
             0x04 => "SMovB64",
             0x07 => "SNotB32",
             0x08 => "SNotB64",
+            0x09 => "SWqmB32",
             0x0A => "SWqmB64",
             0x0B => "SBrevB32",
             0x0F => "SBcnt1I32B32",
             0x13 => "SFF1I32B32",
+            0x14 => "SFF1I32B64",
             0x1D => "SBitset1B32",
             0x1F => "SGetpcB64",
             0x20 => "SSetpcB64",
@@ -816,6 +818,7 @@ public static class Gen5ShaderTranslator
             0x0D => "SBitcmp1B32",
             0x0E => "SBitcmp0B64",
             0x0F => "SBitcmp1B64",
+            0x13 => "SCmpLgU64",
             _ => string.Empty,
         };
 
@@ -842,6 +845,7 @@ public static class Gen5ShaderTranslator
             0x0C => "SWaitcnt",
             0x10 => "SSendmsg",
             0x16 => "STtraceData",
+            0x17 => "SCbranchCdbgsys",
             0x20 => "SInstPrefetch",
             0x21 => "SClause",
             0x23 => "SWaitcntDepctr",
@@ -873,6 +877,8 @@ public static class Gen5ShaderTranslator
             0x0E => "SCmpkLeU32",
             0x0F => "SAddkI32",
             0x10 => "SMulkI32",
+            0x16 => "SWaitcntVscnt",
+            0x17 => "SWaitcntVmcnt",
             _ => string.Empty,
         };
 
@@ -1132,6 +1138,7 @@ public static class Gen5ShaderTranslator
             0x15D => "VSadU32",
             0x15E => "VCvtPkU8F32",
             0x148 => "VBfeU32",
+            0x149 => "VBfeI32",
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
@@ -1255,7 +1262,9 @@ public static class Gen5ShaderTranslator
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            0x3E => "DsBpermuteB32",
             0x4D => "DsWriteB64",
+            0x76 => "DsReadB64",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
             0xFE => "DsReadB96",
@@ -1676,7 +1685,11 @@ public static class Gen5ShaderTranslator
                 break;
             case Gen5ShaderEncoding.Sopk:
                 sources = [new Gen5Operand(Gen5OperandKind.EncodedConstant, word & 0xFFFF)];
-                destinations = [Gen5Operand.Scalar((word >> 16) & 0x7F)];
+                // The wait-counter forms reuse the SOPK SDST field as a
+                // counter selector; they do not write an SGPR.
+                destinations = opcode is "SWaitcntVscnt" or "SWaitcntVmcnt"
+                    ? []
+                    : [Gen5Operand.Scalar((word >> 16) & 0x7F)];
                 break;
             case Gen5ShaderEncoding.Smrd:
             {
@@ -1940,8 +1953,8 @@ public static class Gen5ShaderTranslator
                 control = new Gen5Vop3pControl(
                     (word >> 11) & 0x7,
                     opSelHi,
-                    (extra >> 29) & 0x7,
                     (word >> 8) & 0x7,
+                    (extra >> 29) & 0x7,
                     ((word >> 15) & 1) != 0);
                 break;
             }
@@ -1986,6 +1999,10 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData1),
                     ],
                     "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    "DsBpermuteB32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
                     "DsCmpstB32" or "DsCmpstRtnB32" => [
@@ -2004,9 +2021,12 @@ public static class Gen5ShaderTranslator
                     "DsReadB32" or "DsSwizzleB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsRead2B32" or "DsRead2St64B32" => [
+                    "DsReadB64" or "DsRead2B32" or "DsRead2St64B32" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
+                    ],
+                    "DsBpermuteB32" => [
+                        Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsReadB96" => [
                         Gen5Operand.Vector(vectorDestination),

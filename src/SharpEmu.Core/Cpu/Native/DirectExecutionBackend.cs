@@ -51,6 +51,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public bool IsNoBlockLeaf { get; }
 
+		public bool RequiresVectorState { get; }
+
 		public bool SuppressStrlenTrace { get; }
 
 		public bool IsLoopGuardBoundary { get; }
@@ -63,6 +65,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ExportedFunction? export,
 			bool isLeaf,
 			bool isNoBlockLeaf,
+			bool requiresVectorState,
 			bool suppressStrlenTrace,
 			bool isLoopGuardBoundary,
 			ulong nidHash)
@@ -72,6 +75,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Export = export;
 			IsLeaf = isLeaf;
 			IsNoBlockLeaf = isNoBlockLeaf;
+			RequiresVectorState = requiresVectorState;
 			SuppressStrlenTrace = suppressStrlenTrace;
 			IsLoopGuardBoundary = isLoopGuardBoundary;
 			NidHash = nidHash;
@@ -1226,6 +1230,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				resolvedExport,
 				IsLeafImport(text2),
 				IsNoBlockLeafImport(text2),
+				RequiresVectorImportState(text2),
 				ShouldSuppressStrlenTrace(text2),
 				IsImportLoopGuardBoundary(text2),
 				StableHash64(text2));
@@ -5864,6 +5869,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				? $"{export.LibraryName}:{export.Name}"
 				: nid;
 			return nid is
+				"Zxa0VhQVTsk" or // sceKernelWaitSema
 				"Op8TBGY5KHg" or // pthread_cond_wait
 				"27bAgiJmOh0" or // pthread_cond_timedwait
 				"fzyMKs9kim0";   // sceKernelWaitEqueue

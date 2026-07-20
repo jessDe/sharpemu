@@ -33,6 +33,16 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportVectorRegisterCount = 8;
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
 	private static long _canaryReturnRecoveries;
+	private static readonly bool CaptureImportStackArguments =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_IMPORT_STACK_ARGS"),
+			"1",
+			StringComparison.Ordinal);
+	private static readonly bool PeriodicImportTrace =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_IMPORT_TRACE"),
+			"1",
+			StringComparison.Ordinal);
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -276,12 +286,7 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = num4;
 			activeGuestThreadState.LastImportR8 = num5;
 			activeGuestThreadState.LastImportR9 = num6;
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			CaptureLastImportStackArguments(activeGuestThreadState, argPackPtr);
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
 			// Publish the NID last so readers cannot pair a new import name with
@@ -334,12 +339,18 @@ public sealed partial class DirectExecutionBackend
 		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
 		ExportedFunction? matchedExport = importStubEntry.Export;
+		// Recurring import traces contend on Console.Error's global lock and are
+		// exceptionally expensive for titles that make hundreds of millions of
+		// mutex/audio calls. Keep the bounded startup diagnostics, but make the
+		// forever-running samples explicitly opt-in.
 		bool periodicTrace = num <= 128 ||
 			(num >= 240 && num <= 400) ||
 			(num >= 900 && num <= 1300) ||
-			num % 100000 == 0L ||
-			(importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) ||
-			(importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
+			PeriodicImportTrace && num % 100000 == 0L ||
+			(importStubEntry.Nid == "tsvEmnenz48" &&
+			 (num <= 256 || PeriodicImportTrace && num % 1000 == 0L)) ||
+			(importStubEntry.Nid == "rTXw65xmLIA" &&
+			 (num <= 256 || PeriodicImportTrace && num % 128 == 0)) ||
 			flag ||
 			flag2 ||
 			flag3;
@@ -1178,6 +1189,18 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private unsafe static void LoadImportControlState(CpuContext cpuContext, nint argPackPtr)
+	{
+		// Most leaf HLE calls only consume integer SysV arguments. Preserve the
+		// control state needed if one requests a cooperative block, without
+		// copying all eight 128-bit vector registers on every mutex/memory call.
+		cpuContext[CpuRegister.Rax] = *(ulong*)(argPackPtr + ImportSavedRaxOffset);
+		cpuContext[CpuRegister.R10] = *(ulong*)(argPackPtr + ImportSavedR10Offset);
+		cpuContext[CpuRegister.R11] = *(ulong*)(argPackPtr + ImportSavedR11Offset);
+		cpuContext.Mxcsr = *(uint*)(argPackPtr + ImportSavedMxcsrOffset);
+		cpuContext.FpuControlWord = *(ushort*)(argPackPtr + ImportSavedFpuControlOffset);
+	}
+
 	private unsafe static void StoreImportVectorReturn(CpuContext cpuContext, nint argPackPtr)
 	{
 		// AMD64 returns scalar/vector floating-point values in XMM0 and may use
@@ -1195,6 +1218,21 @@ public sealed partial class DirectExecutionBackend
 	{
 		var address = checked((ulong)argPackPtr + 104UL + (ulong)index * sizeof(ulong));
 		return TryReadHostQword(address, out var value) ? value : 0;
+	}
+
+	private static void CaptureLastImportStackArguments(GuestThreadState state, nint argPackPtr)
+	{
+		if (!CaptureImportStackArguments)
+		{
+			return;
+		}
+
+		state.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
+		state.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
+		state.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
+		state.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
+		state.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
+		state.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
 	}
 
 	private static GuestCpuContinuation CaptureImportBoundaryContinuation(
@@ -1256,7 +1294,14 @@ public sealed partial class DirectExecutionBackend
 				$"active_slot=0x{ActiveGuestReturnSlotAddress:X16}");
 		}
 		cpuContext.Rip = importStubEntry.Address;
-		LoadImportVolatileArguments(cpuContext, argPackPtr);
+		if (importStubEntry.RequiresVectorState)
+		{
+			LoadImportVolatileArguments(cpuContext, argPackPtr);
+		}
+		else
+		{
+			LoadImportControlState(cpuContext, argPackPtr);
+		}
 		cpuContext[CpuRegister.Rdi] = arg0;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
 		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
@@ -1274,23 +1319,26 @@ public sealed partial class DirectExecutionBackend
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
-			activeGuestThreadState.LastImportRdi = arg0;
-			activeGuestThreadState.LastImportRsi = *(ulong*)(argPackPtr + 8);
-			activeGuestThreadState.LastImportRdx = *(ulong*)(argPackPtr + 16);
-			activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
-			activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
-			activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
-			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
-			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
-			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			// Millions of successful mutex/libc leaf calls per frame do not need
+			// ten volatile diagnostic publications each. Retain exact call counts
+			// and sample a coherent last-call snapshot often enough for stall and
+			// crash reports; non-hot imports continue to publish every call.
+			if (!IsHotDiagnosticLeafImport(importStubEntry.Nid) ||
+				(dispatchIndex & 0x3F) == 0)
+			{
+				activeGuestThreadState.LastImportRdi = arg0;
+				activeGuestThreadState.LastImportRsi = *(ulong*)(argPackPtr + 8);
+				activeGuestThreadState.LastImportRdx = *(ulong*)(argPackPtr + 16);
+				activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
+				activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
+				activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
+				CaptureLastImportStackArguments(activeGuestThreadState, argPackPtr);
+				Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
+				Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
+				Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			}
 		}
-		if (dispatchIndex % 100000 == 0)
+		if (PeriodicImportTrace && dispatchIndex % 100000 == 0)
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] Import#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
@@ -1335,7 +1383,10 @@ public sealed partial class DirectExecutionBackend
 				cpuContext,
 				CaptureImportBoundaryContinuation(cpuContext, argPackPtr, returnRip));
 		}
-		StoreImportVectorReturn(cpuContext, argPackPtr);
+		if (importStubEntry.RequiresVectorState)
+		{
+			StoreImportVectorReturn(cpuContext, argPackPtr);
+		}
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
 		{
@@ -1393,6 +1444,15 @@ public sealed partial class DirectExecutionBackend
 
 	private static bool IsNoBlockLeafImport(string nid) =>
 		nid is
+			"T72hz6ffq08" or // scePthreadYield
+			"B5GmVDKwpn0" or // pthread_yield
+			"tn3VlD0hG60" or // scePthreadMutexUnlock
+			"2Z+PpY6CaJg" or // pthread_mutex_unlock
+			"EgmLo6EWgso" or // scePthreadRwlockUnlock
+			"+L98PIbGttk" or // pthread_rwlock_unlock
+			"EI-5-jlq2dE" or // scePthreadGetthreadid
+			"3eqs37G74-s" or // pthread_getthreadid_np
+			"8XTArSPyWHk" or // sceAudioOut2PortSetAttributes
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"a8uLzYY--tM" or // sceAmprAprCommandBufferConstructor
 			"Qs1xtplKo0U" or // sceAmprAprCommandBufferDestructor
@@ -1422,7 +1482,27 @@ public sealed partial class DirectExecutionBackend
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
-			"K-jXhbt2gn4";   // scePthreadMutexTrylock
+			"upoVrzMHFeE" or // scePthreadMutexTrylock
+			"K-jXhbt2gn4" or // pthread_mutex_trylock
+			"SFxTMOfuCkE" or // pthread_rwlock_tryrdlock
+			"XhWHn6P5R7U";   // pthread_rwlock_trywrlock
+
+	private static bool IsHotDiagnosticLeafImport(string nid) =>
+		nid is
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo" or // pthread_mutex_lock
+			"tn3VlD0hG60" or // scePthreadMutexUnlock
+			"2Z+PpY6CaJg" or // pthread_mutex_unlock
+			"Q3VBxCXhUHs" or // memcpy
+			"+P6FRGH4LfA" or // memmove
+			"DfivPArhucg" or // memcmp
+			"ob5xAW4ln-0" or // strchr
+			"9yDWMxEFdJU" or // strrchr
+			"8u8lPzUEq+U";   // memchr
+
+	private static bool RequiresVectorImportState(string nid) =>
+		nid is
+			"Q2V+iqvjgC0";   // vsnprintf / SysV variadic floating-point arguments
 
 	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
 	{
@@ -1508,6 +1588,21 @@ public sealed partial class DirectExecutionBackend
 		// wake another cooperative thread, but the scheduler drain is independent
 		// of the caller's import-boundary bookkeeping.
 		return nid is
+			// Blocking acquisitions still use EnterImportCallFrame in the leaf
+			// dispatcher, so cooperative suspension remains available without the
+			// generic dispatcher's diagnostics and loop-guard overhead.
+			"T72hz6ffq08" or // scePthreadYield
+			"B5GmVDKwpn0" or // pthread_yield
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo" or // pthread_mutex_lock
+			"Ox9i0c7L5w0" or // scePthreadRwlockRdlock
+			"iGjsr1WAtI0" or // pthread_rwlock_rdlock
+			"mqdNorrB+gI" or // scePthreadRwlockWrlock
+			"sIlRvQqsN2Y" or // pthread_rwlock_wrlock
+			"upoVrzMHFeE" or // scePthreadMutexTrylock
+			"K-jXhbt2gn4" or // pthread_mutex_trylock
+			"SFxTMOfuCkE" or // pthread_rwlock_tryrdlock
+			"XhWHn6P5R7U" or // pthread_rwlock_trywrlock
 			"tn3VlD0hG60" or // scePthreadMutexUnlock
 			"2Z+PpY6CaJg" or // pthread_mutex_unlock
 			"EgmLo6EWgso" or // scePthreadRwlockUnlock
@@ -1777,6 +1872,7 @@ public sealed partial class DirectExecutionBackend
 	private static bool IsImportLoopGuardBoundary(string nid) =>
 		nid is
 			"1jfXLRVzisc" or // sceKernelUsleep
+			"Zxa0VhQVTsk" or // sceKernelWaitSema
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait

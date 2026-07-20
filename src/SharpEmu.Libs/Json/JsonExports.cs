@@ -256,12 +256,34 @@ public static class JsonExports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        // SCE's length-based parser accepts the common C/C++ convention where the
+        // supplied byte count includes the terminating NUL. System.Text.Json treats
+        // that NUL as a second token, so remove only trailing C-string padding while
+        // preserving embedded NULs as an error.
+        var effectiveSize = buffer.Length;
+        while (effectiveSize > 0 && buffer[effectiveSize - 1] == 0)
+        {
+            effectiveSize--;
+        }
+
+        if (effectiveSize == 0)
+        {
+            return SetReturn(ctx, SceJsonParserErrorEmptyBuffer);
+        }
+
         try
         {
-            using var document = JsonDocument.Parse(buffer);
+            using var document = JsonDocument.Parse(
+                buffer.AsMemory(0, effectiveSize),
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = true,
+                    CommentHandling = JsonCommentHandling.Skip,
+                    MaxDepth = 256,
+                });
             var element = document.RootElement.Clone();
             StoreValue(ctx, valueAddress, element);
-            TraceJsonText("Parser.parse", valueAddress, Encoding.UTF8.GetString(buffer));
+            TraceJsonText("Parser.parse", valueAddress, Encoding.UTF8.GetString(buffer, 0, effectiveSize));
             return SetReturn(ctx, 0);
         }
         catch (JsonException)
@@ -352,6 +374,40 @@ public static class JsonExports
         StoreValue(ctx, childAddress, child);
         ctx[CpuRegister.Rax] = childAddress;
         TraceJsonText("Value.index", valueAddress, key);
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "wLsJlmgEIaI",
+        ExportName = "_ZN3sce4Json5Value10referValueERKNS0_6StringE",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceJson")]
+    public static int ValueReferString(CpuContext ctx)
+    {
+        var valueAddress = ctx[CpuRegister.Rdi];
+        var stringAddress = ctx[CpuRegister.Rsi];
+        if (!TryGetString(ctx, stringAddress, out var key))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        var parent = GetValue(valueAddress);
+        // referValue is the nullable lookup API (titles explicitly test its return
+        // value before using operator[]). A missing member must therefore return
+        // nullptr, not a non-null Value whose payload is JSON null.
+        if (parent.ValueKind != System.Text.Json.JsonValueKind.Object ||
+            !parent.TryGetProperty(key, out var property) ||
+            !TryAllocateGuestObject(ctx, ValueObjectSize, out var childAddress))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            TraceJsonText("Value.referValue.missing", valueAddress, key);
+            return 0;
+        }
+
+        StoreValue(ctx, childAddress, property);
+        ctx[CpuRegister.Rax] = childAddress;
+        TraceJsonText("Value.referValue", valueAddress, key);
         return 0;
     }
 
@@ -652,6 +708,32 @@ public static class JsonExports
             bytes[index] = current[0];
         }
 
+        return false;
+    }
+
+    private static bool TryGetString(CpuContext ctx, ulong stringAddress, out string value)
+    {
+        if (JsonObjectHeap.Strings.TryGetValue(stringAddress, out var sharedValue))
+        {
+            value = sharedValue;
+            return true;
+        }
+
+        if (_strings.TryGetValue(stringAddress, out var privateState))
+        {
+            value = privateState.Value;
+            return true;
+        }
+
+        // Fall back to the usual one-pointer String representation for objects
+        // constructed inside guest code rather than through an imported ctor.
+        if (ctx.TryReadUInt64(stringAddress, out var textAddress) &&
+            TryReadUtf8CString(ctx, textAddress, 4096, out value))
+        {
+            return true;
+        }
+
+        value = string.Empty;
         return false;
     }
 

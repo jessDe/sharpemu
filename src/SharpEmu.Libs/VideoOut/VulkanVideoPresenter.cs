@@ -360,16 +360,19 @@ internal static unsafe class VulkanVideoPresenter
     // newest generation; older immutable versions are retired immediately.
     private const int MaxPendingGuestFlipVersions = 4;
     // A count-only queue bound is not a memory bound: one compute dispatch can
-    // carry dozens of full-resolution texture snapshots.  At 4K, 64 queued
+    // carry dozens of full-resolution texture snapshots. At 4K, 64 queued
     // dispatches retained more than 12 GiB of managed byte arrays before the
-    // render thread could upload them.  Keep the count cap for small work and
-    // independently apply backpressure to the actual retained payload.
+    // render thread could upload them. Keep the count cap for small work and
+    // independently apply backpressure to the actual retained payload. The
+    // dedicated Windows/Linux render thread needs enough headroom for a frame's
+    // parallel draw-worker burst (ASTRO BOT reaches about 295 MiB); macOS keeps
+    // the tighter bound because rendering shares its application main thread.
     private static readonly ulong _maxPendingGuestWorkBytes =
         (ulong.TryParse(
              Environment.GetEnvironmentVariable("SHARPEMU_PENDING_GUEST_WORK_MB"),
              out var pendingGuestWorkMb) && pendingGuestWorkMb > 0
             ? pendingGuestWorkMb
-            : 256UL) * 1024UL * 1024UL;
+            : OperatingSystem.IsMacOS() ? 256UL : 512UL) * 1024UL * 1024UL;
     private static readonly int _maxGuestWorkPerRender =
         int.TryParse(
             Environment.GetEnvironmentVariable("SHARPEMU_MAX_GUEST_WORK_PER_RENDER"),
@@ -2613,12 +2616,16 @@ internal static unsafe class VulkanVideoPresenter
         return work switch
         {
             VulkanOffscreenGuestDraw offscreen =>
+                $" shader=0x{offscreen.ShaderAddress:X16}" +
+                $" targets=[{string.Join(',', offscreen.Targets.Select(static target => $"0x{target.Address:X16}:{target.Width}x{target.Height}:f{target.Format}/n{target.NumberType}"))}]" +
+                $" textures={offscreen.Draw.Textures.Count}" +
                 $" textures_mb={SumTextures(offscreen.Draw.Textures)}" +
                 $" globals_mb={SumGlobals(offscreen.Draw.GlobalMemoryBuffers)}" +
                 $" vertex_mb={offscreen.Draw.VertexBuffers.Aggregate(0UL, static (sum, buffer) => SaturatingAdd(sum, (ulong)buffer.Data.LongLength)) / (1024 * 1024)}" +
                 $" index_mb={(ulong)(offscreen.Draw.IndexBuffer?.Data.LongLength ?? 0) / (1024 * 1024)}" +
                 $" vertex_lengths=[{string.Join(',', offscreen.Draw.VertexBuffers.Select(static buffer => $"{buffer.Length}/{buffer.Data.LongLength}:s{buffer.Stride}:o{buffer.OffsetBytes}"))}]" +
-                $" global_lengths=[{string.Join(',', offscreen.Draw.GlobalMemoryBuffers.Select(static buffer => buffer.Length))}]",
+                $" texture_bindings=[{string.Join(',', offscreen.Draw.Textures.Select(static texture => $"0x{texture.Address:X16}:{texture.Width}x{texture.Height}:f{texture.Format}/n{texture.NumberType}:storage{(texture.IsStorage ? 1 : 0)}:fallback{(texture.IsFallback ? 1 : 0)}:bytes{texture.RgbaPixels.Length}"))}]" +
+                $" global_bindings=[{string.Join(',', offscreen.Draw.GlobalMemoryBuffers.Select(static buffer => $"0x{buffer.BaseAddress:X16}:{buffer.Length}/{buffer.Data.LongLength}:w{(buffer.Writable ? 1 : 0)}"))}]",
             VulkanComputeGuestDispatch compute =>
                 $" textures_mb={SumTextures(compute.Textures)}" +
                 $" globals_mb={SumGlobals(compute.GlobalMemoryBuffers)}" +
@@ -2661,13 +2668,24 @@ internal static unsafe class VulkanVideoPresenter
         return bytes;
     }
 
-    private static ulong GetGlobalBufferPayloadBytes(
+    internal static ulong GetGlobalBufferPayloadBytes(
         IReadOnlyList<GuestMemoryBuffer> buffers)
     {
         var bytes = 0UL;
+        // Several shader descriptors can be aliases/views over the same
+        // evaluator snapshot. The queue retains that backing array once, so
+        // charging it once per binding overstates retained memory and can park
+        // every guest graphics producer behind a backpressure budget that has
+        // not actually been exhausted. Vertex payload accounting already uses
+        // the same reference-identity rule.
+        var uniqueData = new HashSet<byte[]>(
+            System.Collections.Generic.ReferenceEqualityComparer.Instance);
         foreach (var buffer in buffers)
         {
-            bytes = SaturatingAdd(bytes, (ulong)buffer.Data.LongLength);
+            if (uniqueData.Add(buffer.Data))
+            {
+                bytes = SaturatingAdd(bytes, (ulong)buffer.Data.LongLength);
+            }
         }
 
         return bytes;
@@ -2830,6 +2848,11 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Stack<Fence> _recycledGuestFences = new();
         private readonly Stack<CommandBuffer> _recycledGuestCommandBuffers = new();
         private readonly List<(VkBuffer Buffer, DeviceMemory Memory)> _batchRetireBuffers = new();
+        // True after recording a shader write which has not yet been followed
+        // by a shader-memory visibility barrier. Runtime scalar/constant
+        // buffers make almost every draw have a descriptor, but they are
+        // read-only and must not force an ALL_COMMANDS barrier per draw.
+        private bool _unbarrieredGlobalShaderWrites;
         private const int MaxRecycledGuestFences = 32;
         private const int MaxRecycledGuestCommandBuffers = 32;
         private VkBuffer _stagingBuffer;
@@ -6122,7 +6145,6 @@ internal static unsafe class VulkanVideoPresenter
                         sharedVertexResources.Add(guestVertex.Data, vertexResource);
                     }
                 }
-
                 if (draw.IndexBuffer is { Length: > 0 } indexBuffer)
                 {
                     resources.IndexBuffer = CreateHostBuffer(
@@ -6156,6 +6178,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
+                ReturnPooledGlobalBufferData(draw.GlobalMemoryBuffers);
                 var returnedVertexData = new HashSet<byte[]>(
                     System.Collections.Generic.ReferenceEqualityComparer.Instance);
                 foreach (var vertex in draw.VertexBuffers)
@@ -6274,6 +6297,10 @@ internal static unsafe class VulkanVideoPresenter
             {
                 DestroyTranslatedDrawResources(resources);
                 throw;
+            }
+            finally
+            {
+                ReturnPooledGlobalBufferData(dispatch.GlobalMemoryBuffers);
             }
         }
 
@@ -8452,11 +8479,6 @@ internal static unsafe class VulkanVideoPresenter
                     $"[LOADER][TRACE] vk.global_buffer base=0x{guestBuffer.BaseAddress:X16} " +
                     $"bytes={guestBuffer.Length}");
             }
-            if (guestBuffer.Pooled)
-            {
-                GuestDataPool.Shared.Return(guestBuffer.Data);
-            }
-
             return new GlobalBufferResource
             {
                 BaseAddress = guestBuffer.BaseAddress,
@@ -8532,10 +8554,6 @@ internal static unsafe class VulkanVideoPresenter
             finally
             {
                 GuestDataPool.Shared.Return(snapshot);
-                if (guestBuffer.Pooled)
-                {
-                    GuestDataPool.Shared.Return(guestBuffer.Data);
-                }
             }
         }
 
@@ -8547,11 +8565,6 @@ internal static unsafe class VulkanVideoPresenter
                 BufferUsageFlags.StorageBufferBit,
                 out var memory,
                 out var mapped);
-            if (guestBuffer.Pooled)
-            {
-                GuestDataPool.Shared.Return(guestBuffer.Data);
-            }
-
             return new GlobalBufferResource
             {
                 BaseAddress = 0,
@@ -8565,6 +8578,27 @@ internal static unsafe class VulkanVideoPresenter
                 GuestOffset = 0,
                 GuestSize = (ulong)Math.Max(guestBuffer.Length, sizeof(uint)),
             };
+        }
+
+        /// <summary>
+        /// Releases evaluator snapshots only after every descriptor in the work
+        /// item has consumed them. Several shader bindings may deliberately alias
+        /// the same pooled array; returning it from CreateGlobalBufferResource
+        /// allowed the concurrently running guest thread to rent and overwrite it
+        /// before the remaining aliases were uploaded.
+        /// </summary>
+        private static void ReturnPooledGlobalBufferData(
+            IReadOnlyList<GuestMemoryBuffer> buffers)
+        {
+            var returned = new HashSet<byte[]>(
+                System.Collections.Generic.ReferenceEqualityComparer.Instance);
+            foreach (var buffer in buffers)
+            {
+                if (buffer.Pooled && returned.Add(buffer.Data))
+                {
+                    GuestDataPool.Shared.Return(buffer.Data);
+                }
+            }
         }
 
         private void PrepareGuestBufferAllocations(
@@ -9949,6 +9983,18 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            var currentWrites = false;
+            foreach (var buffer in resources.GlobalMemoryBuffers)
+            {
+                currentWrites |= buffer.Writable;
+            }
+
+            if (!_unbarrieredGlobalShaderWrites)
+            {
+                _unbarrieredGlobalShaderWrites = currentWrites;
+                return;
+            }
+
             // Queue submission order alone is not a shader-memory dependency.
             // This makes stores through any aliased guest view available to
             // later vertex/fragment/compute reads and writes on the same queue.
@@ -9960,7 +10006,9 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.CmdPipelineBarrier(
                 commandBuffer,
-                PipelineStageFlags.AllCommandsBit,
+                PipelineStageFlags.ComputeShaderBit |
+                PipelineStageFlags.VertexShaderBit |
+                PipelineStageFlags.FragmentShaderBit,
                 destinationStages,
                 0,
                 1,
@@ -9969,6 +10017,7 @@ internal static unsafe class VulkanVideoPresenter
                 null,
                 0,
                 null);
+            _unbarrieredGlobalShaderWrites = currentWrites;
         }
 
         private static void MarkGuestBufferDirty(
@@ -12443,7 +12492,13 @@ internal static unsafe class VulkanVideoPresenter
                 var work = pendingGuestWork.Work;
                 var deferGuestWork = false;
 
-                var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
+                // Once the producer has actually hit queue backpressure, time
+                // renderer work automatically. This is effectively free before
+                // a stall and makes the responsible draw/dispatch visible in a
+                // normal user log without requiring a diagnostic rerun.
+                var traceWork =
+                    Volatile.Read(ref _guestQueueBackpressureTraceCount) != 0 ||
+                    ShouldTracePresentedGuestImageContentsForDiagnostics();
                 var workStart = traceWork ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 if (traceWork && work is VulkanComputeGuestDispatch or VulkanOffscreenGuestDraw)
                 {
@@ -12506,7 +12561,7 @@ internal static unsafe class VulkanVideoPresenter
                         {
                             VulkanComputeGuestDispatch c => $"compute cs=0x{c.ShaderAddress:X16} groups={c.GroupCountX}x{c.GroupCountY}x{c.GroupCountZ}",
                             VulkanOffscreenGuestDraw d =>
-                                $"draw mrt={d.Targets.Count} " +
+                                $"draw ps=0x{d.ShaderAddress:X16} mrt={d.Targets.Count} " +
                                 $"rt=0x{d.Targets[0].Address:X16} " +
                                 $"{d.Targets[0].Width}x{d.Targets[0].Height}",
                             _ => work.GetType().Name,

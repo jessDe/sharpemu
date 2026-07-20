@@ -88,6 +88,18 @@ public sealed class MemcpyHleRoutingTests
             name is "IsWindows" or "IsLinux" or "IsMacOS" or "IsOSPlatform" or "IsFreeBSD");
     }
 
+    [Fact]
+    public void LeafVectorState_IsSkippedForMemcpyButKeptForVariadicFormatting()
+    {
+        var method = typeof(DirectExecutionBackend).GetMethod(
+            "RequiresVectorImportState",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        Assert.False((bool)method.Invoke(null, [MemcpyNid])!);
+        Assert.True((bool)method.Invoke(null, ["Q2V+iqvjgC0"])!);
+    }
+
     private static HashSet<string> ResolveCallees(MethodBase method)
     {
         var il = method.GetMethodBody()?.GetILAsByteArray();

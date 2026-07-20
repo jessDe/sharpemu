@@ -1163,6 +1163,8 @@ public static partial class Gen5MslTranslator
                 "SCbranchVccnz" => $"(s[{VccLoRegister}] | s[{VccHiRegister}]) != 0u",
                 "SCbranchExecz" => $"(s[{ExecLoRegister}] | s[{ExecHiRegister}]) == 0u",
                 "SCbranchExecnz" => $"(s[{ExecLoRegister}] | s[{ExecHiRegister}]) != 0u",
+                // The emulator never runs shaders under the GPU system debugger.
+                "SCbranchCdbgsys" => "false",
                 _ => string.Empty,
             };
             return condition.Length != 0;
@@ -1206,6 +1208,8 @@ public static partial class Gen5MslTranslator
             {
                 case "SNop":
                 case "SWaitcnt":
+                case "SWaitcntVscnt":
+                case "SWaitcntVmcnt":
                 case "SInstPrefetch":
                 case "STtraceData":
                 case "SClause":
@@ -1468,7 +1472,8 @@ public static partial class Gen5MslTranslator
             out string error)
         {
             error = string.Empty;
-            if (control.Gds)
+            // BPERMUTE is a wave-lane shuffle and does not access LDS/GDS.
+            if (control.Gds && instruction.Opcode != "DsBpermuteB32")
             {
                 error = "GDS data share is not implemented";
                 return false;

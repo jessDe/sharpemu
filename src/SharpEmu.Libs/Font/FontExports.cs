@@ -82,6 +82,27 @@ public static class FontExports
     public static int BindRenderer(CpuContext ctx) => SetSuccess(ctx);
 
     [SysAbiExport(
+        Nid = "1QjhKxrsOB8",
+        ExportName = "sceFontUnbindRenderer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int UnbindRenderer(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "exAxkyVLt0s",
+        ExportName = "sceFontDestroyRenderer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int DestroyRenderer(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "vzHs3C8lWJk",
+        ExportName = "sceFontCloseFont",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int CloseFont(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
         Nid = "N1EBMeGhf7E",
         ExportName = "sceFontSetScalePixel",
         Target = Generation.Gen5,
@@ -138,6 +159,37 @@ public static class FontExports
 
         // Baseline, line advance, decoration extent: the same invented geometry
         // as GetRenderCharGlyphMetrics.
+        var values = new[] { 12.0f, 16.0f, 0.0f };
+        for (var index = 0; index < values.Length; index++)
+        {
+            if (!TryWriteUInt32(
+                    ctx,
+                    layoutAddress + (ulong)(index * sizeof(float)),
+                    BitConverter.SingleToUInt32Bits(values[index])))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return SetSuccess(ctx);
+    }
+
+    [SysAbiExport(
+        Nid = "3BrWWFU+4ts",
+        ExportName = "sceFontGetVerticalLayout",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GetVerticalLayout(CpuContext ctx)
+    {
+        var layoutAddress = ctx[CpuRegister.Rsi];
+        if (layoutAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // SceFontVerticalLayout mirrors the three-float horizontal structure:
+        // baseline X, line width, and effect width. The compatibility renderer
+        // uses the same nominal geometry in the transposed direction.
         var values = new[] { 12.0f, 16.0f, 0.0f };
         for (var index = 0; index < values.Length; index++)
         {
@@ -261,6 +313,67 @@ public static class FontExports
     }
 
     [SysAbiExport(
+        Nid = "C-4Qw5Srlyw",
+        ExportName = "sceFontGenerateCharGlyph",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GenerateCharGlyph(CpuContext ctx)
+    {
+        var glyphStorageAddress = ctx[CpuRegister.Rdx];
+        var glyphOutAddress = ctx[CpuRegister.Rcx];
+        if (glyphStorageAddress == 0 || glyphOutAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // The glyph is consumed synchronously and deleted before the caller
+        // returns, so its caller-owned descriptor is a stable opaque handle.
+        return ctx.TryWriteUInt64(glyphOutAddress, glyphStorageAddress)
+            ? SetSuccess(ctx)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "8-zmgsxkBek",
+        ExportName = "sceFontGlyphDefineAttribute",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int GlyphDefineAttribute(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] != 0
+            ? SetSuccess(ctx)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+
+    [SysAbiExport(
+        Nid = "LHDoRWVFGqk",
+        ExportName = "sceFontDeleteGlyph",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int DeleteGlyph(CpuContext ctx) => SetSuccess(ctx);
+
+    [SysAbiExport(
+        Nid = "kAenWy1Zw5o",
+        ExportName = "sceFontRenderCharGlyphImageHorizontal",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int RenderCharGlyphImageHorizontal(CpuContext ctx)
+    {
+        var surfaceAddress = ctx[CpuRegister.Rdx];
+        var metricsAddress = ctx[CpuRegister.Rcx];
+        if (surfaceAddress == 0 || metricsAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!WriteNominalGlyphMetrics(ctx, metricsAddress) ||
+            !TryRenderCompatibilityGlyph(ctx, surfaceAddress, unchecked((uint)ctx[CpuRegister.Rsi])))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetSuccess(ctx);
+    }
+
+    [SysAbiExport(
         Nid = "gdUCnU0gHdI",
         ExportName = "sceFontRenderSurfaceInit",
         Target = Generation.Gen5,
@@ -288,6 +401,73 @@ public static class FontExports
         }
 
         return SetSuccess(ctx);
+    }
+
+    private static bool WriteNominalGlyphMetrics(CpuContext ctx, ulong metricsAddress)
+    {
+        var values = new[] { 8.0f, 16.0f, 0.0f, 12.0f, 8.0f, 0.0f, 0.0f, 16.0f };
+        for (var index = 0; index < values.Length; index++)
+        {
+            if (!TryWriteUInt32(
+                    ctx,
+                    metricsAddress + (ulong)(index * sizeof(float)),
+                    BitConverter.SingleToUInt32Bits(values[index])))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool TryRenderCompatibilityGlyph(CpuContext ctx, ulong surfaceAddress, uint character)
+    {
+        if (!ctx.TryReadUInt64(surfaceAddress, out var pixels) ||
+            !ctx.TryReadUInt32(surfaceAddress + 0x08, out var stride) ||
+            !ctx.TryReadUInt32(surfaceAddress + 0x0C, out var pixelBytes) ||
+            !ctx.TryReadUInt32(surfaceAddress + 0x10, out var width) ||
+            !ctx.TryReadUInt32(surfaceAddress + 0x14, out var height) ||
+            pixels == 0 || stride == 0 || pixelBytes is 0 or > 4 || width == 0 || height == 0)
+        {
+            return false;
+        }
+
+        ctx.GetXmmRegister(0, out var xBits, out _);
+        ctx.GetXmmRegister(1, out var yBits, out _);
+        var originX = (int)MathF.Floor(BitConverter.UInt32BitsToSingle((uint)xBits));
+        var baselineY = (int)MathF.Floor(BitConverter.UInt32BitsToSingle((uint)yBits));
+        var originY = baselineY - 12;
+        Span<byte> pixel = stackalloc byte[4];
+        pixel[..(int)pixelBytes].Fill(0xFF);
+
+        for (var row = 0; row < 12; row++)
+        {
+            var y = originY + row;
+            if ((uint)y >= height)
+            {
+                continue;
+            }
+            for (var column = 0; column < 7; column++)
+            {
+                var x = originX + column;
+                if ((uint)x >= width)
+                {
+                    continue;
+                }
+
+                // A deterministic compact bitmap: retain an outline and use
+                // character bits for the interior so different glyphs remain
+                // visually distinguishable in the compatibility renderer.
+                var draw = row is 0 or 11 || column is 0 or 6 ||
+                    ((character >> ((row + column) & 7)) & 1) != 0;
+                if (draw && !ctx.Memory.TryWrite(
+                        pixels + checked((ulong)y * stride) + checked((ulong)x * pixelBytes),
+                        pixel[..(int)pixelBytes]))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private static int ReturnSelection(CpuContext ctx, ref ulong selectionAddress, uint objectSize)
