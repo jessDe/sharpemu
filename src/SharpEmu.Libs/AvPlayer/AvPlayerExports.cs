@@ -365,6 +365,9 @@ public static class AvPlayerExports
     public static int AvPlayerPause(CpuContext ctx)
     {
         PlayerState player;
+        var deliverDeferredStop = false;
+        var deliverHostFallbackTeardownStop = false;
+        Task? hostFallbackTask = null;
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var foundPlayer))
@@ -372,12 +375,92 @@ public static class AvPlayerExports
                 return SetReturn(ctx, InvalidParameters);
             }
             player = foundPlayer;
+            Trace(
+                $"pause handle=0x{player.Handle:X16} elapsed_ms={player.PlaybackClock.ElapsedMilliseconds} " +
+                $"duration_ms={player.DurationMilliseconds} host_fallback={player.HostVideoTask is not null} " +
+                $"pending_stop={player.PendingStopEvent}");
 
-            player.Paused = true;
-            player.PlaybackClock.Stop();
+            // Host-video fallback reaches EOF on a worker thread and cannot
+            // invoke guest callbacks there. Some titles pause the player as
+            // their next AvPlayer call instead of polling IsActive/GetVideoData.
+            // Preserve the EOF transition in that case: replacing it with a
+            // StatePause event leaves the intro controller waiting forever.
+            if (player.PendingStopEvent)
+            {
+                player.PendingStopEvent = false;
+                deliverDeferredStop = true;
+            }
+            else if (player.HostVideoTask is not null)
+            {
+                // The compatibility presenter owns the visible boot movie and
+                // completes on a host worker. Keep this guest call alive until
+                // that worker can queue StateStop; otherwise the title issues
+                // StatePause halfway through the movie and never enters another
+                // AvPlayer export from which the queued stop can be delivered.
+                hostFallbackTask = player.HostVideoTask;
+            }
+            else
+            {
+                player.Paused = true;
+                player.PlaybackClock.Stop();
+            }
         }
 
-        NotifyEvent(ctx, player, 4); // StatePause
+        if (hostFallbackTask is not null)
+        {
+            var elapsedMilliseconds = (ulong)Math.Max(0, player.PlaybackClock.ElapsedMilliseconds);
+            var remainingMilliseconds = player.DurationMilliseconds > elapsedMilliseconds
+                ? player.DurationMilliseconds - elapsedMilliseconds
+                : 0;
+            var timeoutMilliseconds = player.DurationMilliseconds == 0
+                ? 10_000
+                : checked((int)Math.Clamp(remainingMilliseconds + 2_000, 1_000UL, 15_000UL));
+            try
+            {
+                _ = hostFallbackTask.Wait(timeoutMilliseconds);
+            }
+            catch (AggregateException exception)
+            {
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][WARN] Host fallback completion wait failed: " +
+                    exception.GetBaseException().Message);
+            }
+
+            lock (StateGate)
+            {
+                if (Players.TryGetValue(player.Handle, out var current) &&
+                    ReferenceEquals(current, player))
+                {
+                    // The host presenter can itself be waiting for the guest
+                    // pause callback to return. Once the source's remaining
+                    // presentation interval has elapsed, commit EOF directly
+                    // to break that cycle and make the stop notification
+                    // deterministic.
+                    player.PendingStopEvent = false;
+                    player.EndOfStream = true;
+                    player.Started = false;
+                    player.Paused = false;
+                    player.PlaybackClock.Stop();
+                }
+            }
+
+            // AvPlayerClose may remove the handle while the host movie is
+            // finishing. The event target was captured before that race and
+            // is still the terminal notification owed to the title; table
+            // removal must not downgrade it back to StatePause.
+            deliverDeferredStop = true;
+            deliverHostFallbackTeardownStop = true;
+        }
+
+        NotifyEvent(ctx, player, deliverDeferredStop ? 1UL : 4UL); // StateStop / StatePause
+        if (deliverHostFallbackTeardownStop)
+        {
+            // The compatibility path substitutes both guest video allocation
+            // and presentation. Titles using it observe one stop for playback
+            // completion and a second while tearing down that substituted
+            // player; both are present on the native/successful transition.
+            NotifyEvent(ctx, player, 1); // StateStop (fallback teardown)
+        }
         return SetReturn(ctx, 0);
     }
 
@@ -625,7 +708,13 @@ public static class AvPlayerExports
         ulong handle,
         int width,
         int height,
-        ulong durationMilliseconds)
+        ulong durationMilliseconds,
+        bool pendingStopEvent = false,
+        bool endOfStream = false,
+        ulong eventCallback = 0,
+        ulong eventObject = 0,
+        bool completedHostFallback = false,
+        bool looping = false)
     {
         PlayerState? previous;
         lock (StateGate)
@@ -637,6 +726,12 @@ public static class AvPlayerExports
                 Width = width,
                 Height = height,
                 DurationMilliseconds = durationMilliseconds,
+                PendingStopEvent = pendingStopEvent,
+                EndOfStream = endOfStream,
+                EventCallback = eventCallback,
+                EventObject = eventObject,
+                HostVideoTask = completedHostFallback ? Task.CompletedTask : null,
+                Looping = looping,
             };
         }
 

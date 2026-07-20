@@ -18,6 +18,80 @@ public sealed class AvPlayerStreamInfoTests
     private const ulong DurationMilliseconds = 0x0102_0304_0506_0708;
     private const byte Sentinel = 0xAB;
 
+    [Fact]
+    public void PauseDeliversDeferredHostFallbackStopBeforePause()
+    {
+        const ulong callback = 0x8000_1234;
+        const ulong callbackObject = 0x5000_5678;
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var context = new CpuContext(memory, Generation.Gen5);
+        var scheduler = new RecordingGuestThreadScheduler();
+        var previousScheduler = GuestThreadExecution.Scheduler;
+
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            pendingStopEvent: true,
+            endOfStream: true,
+            eventCallback: callback,
+            eventObject: callbackObject);
+        GuestThreadExecution.Scheduler = scheduler;
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+
+            Assert.Equal(0, AvPlayerExports.AvPlayerPause(context));
+            Assert.Equal([(callback, callbackObject, 1UL)], scheduler.Calls);
+
+            Assert.Equal(0, AvPlayerExports.AvPlayerPause(context));
+            Assert.Equal(
+                [(callback, callbackObject, 1UL), (callback, callbackObject, 4UL)],
+                scheduler.Calls);
+        }
+        finally
+        {
+            GuestThreadExecution.Scheduler = previousScheduler;
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
+    [Fact]
+    public void PauseDeliversStopForCompletedHostFallbackWithoutPendingPoll()
+    {
+        const ulong callback = 0x8000_1234;
+        const ulong callbackObject = 0x5000_5678;
+        var context = new CpuContext(new FakeCpuMemory(BaseAddress, MemorySize), Generation.Gen5);
+        var scheduler = new RecordingGuestThreadScheduler();
+        var previousScheduler = GuestThreadExecution.Scheduler;
+
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            endOfStream: true,
+            eventCallback: callback,
+            eventObject: callbackObject,
+            completedHostFallback: true,
+            looping: true);
+        GuestThreadExecution.Scheduler = scheduler;
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+            Assert.Equal(0, AvPlayerExports.AvPlayerPause(context));
+            Assert.Equal(
+                [(callback, callbackObject, 1UL), (callback, callbackObject, 1UL)],
+                scheduler.Calls);
+        }
+        finally
+        {
+            GuestThreadExecution.Scheduler = previousScheduler;
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
     [Theory]
     [InlineData(0u)]
     [InlineData(1u)]
@@ -163,5 +237,90 @@ public sealed class AvPlayerStreamInfoTests
         Assert.Equal(
             (expectedWidth, expectedHeight),
             AvPlayerExports.ComputeHostPreviewSize(sourceWidth, sourceHeight, maximumWidth));
+    }
+
+    private sealed class RecordingGuestThreadScheduler : IGuestThreadScheduler
+    {
+        public List<(ulong EntryPoint, ulong Object, ulong EventId)> Calls { get; } = [];
+
+        public bool SupportsGuestContextTransfer => false;
+
+        public void RegisterGuestThreadContext(ulong threadHandle, CpuContext context) { }
+
+        public bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error)
+        {
+            error = null;
+            return false;
+        }
+
+        public bool TryJoinThread(CpuContext callerContext, ulong threadHandle, out ulong returnValue, out string? error)
+        {
+            returnValue = 0;
+            error = null;
+            return false;
+        }
+
+        public void Pump(CpuContext callerContext, string reason) { }
+
+        public int WakeBlockedThreads(string wakeKey, int maxCount = int.MaxValue) => 0;
+
+        public bool TrySetGuestThreadPriority(ulong guestThreadHandle, int guestPriority) => false;
+
+        public bool TrySetGuestThreadAffinity(ulong guestThreadHandle, ulong affinityMask) => false;
+
+        public IReadOnlyList<GuestThreadSnapshot> SnapshotThreads() => [];
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext,
+            ulong entryPoint,
+            ulong arg0,
+            ulong arg1,
+            ulong stackAddress,
+            ulong stackSize,
+            string reason,
+            out string? error)
+        {
+            error = null;
+            return false;
+        }
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext,
+            ulong entryPoint,
+            ulong arg0,
+            ulong arg1,
+            ulong arg2,
+            ulong stackAddress,
+            ulong stackSize,
+            string reason,
+            out ulong returnValue,
+            out string? error)
+        {
+            Calls.Add((entryPoint, arg0, arg1));
+            returnValue = 0;
+            error = null;
+            return true;
+        }
+
+        public bool TryCallGuestContinuation(
+            CpuContext callerContext,
+            GuestCpuContinuation continuation,
+            string reason,
+            out string? error)
+        {
+            error = null;
+            return false;
+        }
+
+        public bool TryRaiseGuestException(
+            CpuContext callerContext,
+            ulong threadHandle,
+            ulong handler,
+            int exceptionType,
+            out string? error)
+        {
+            error = null;
+            return false;
+        }
     }
 }
