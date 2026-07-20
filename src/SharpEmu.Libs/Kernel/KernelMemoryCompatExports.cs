@@ -125,6 +125,7 @@ public static partial class KernelMemoryCompatExports
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     private static readonly HashSet<string> _negativeStatCache = new(HostFsPathComparer);
     private static readonly ConcurrentDictionary<string, ulong> _aprFileSizeCache = new(HostFsPathComparer);
+    private static readonly ConcurrentDictionary<string, byte> _aprMissingFileCache = new(HostFsPathComparer);
     private static long _nextFileDescriptor = 2;
 
     internal static int AllocateGuestFileDescriptor()
@@ -7063,6 +7064,11 @@ public static partial class KernelMemoryCompatExports
             return true;
         }
 
+        if (_aprMissingFileCache.ContainsKey(cachePath))
+        {
+            return false;
+        }
+
         try
         {
             var fileInfo = new FileInfo(cachePath);
@@ -7076,6 +7082,11 @@ public static partial class KernelMemoryCompatExports
 
             if (!new DirectoryInfo(cachePath).Exists)
             {
+                // Level documents repeatedly probe optional asset variants. A
+                // fresh FileInfo/DirectoryInfo query for every miss makes that
+                // workload filesystem-bound even though neither CPU nor GPU is
+                // busy. Emulator writes invalidate this entry below.
+                _aprMissingFileCache.TryAdd(cachePath, 0);
                 return false;
             }
 
@@ -7391,6 +7402,7 @@ public static partial class KernelMemoryCompatExports
         }
 
         _aprFileSizeCache.TryRemove(hostPath, out _);
+        _aprMissingFileCache.TryRemove(hostPath, out _);
     }
 
     private static string PreviewIoBytes(byte[] buffer, int count, int maxBytes)

@@ -13,6 +13,8 @@ public sealed class WorldMapImportTests
     {
         { "00oCq0RwSAY", "_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_" },
         { "amuBfI-AQc4", "sceRudpInit" },
+        { "SUEVes8gvmw", "sceRudpSetEventHandler" },
+        { "6PBNpsgyaxw", "sceRudpEnableInternalIOThread" },
         { "n1-v6FgU7MQ", "sceKernelConfiguredFlexibleMemorySize" },
         { "Sygnk9dr5WQ", "sceShareRegisterContentEventCallback" },
         { "tU5e3f9gSiU", "sceKernelIsTrinityMode" },

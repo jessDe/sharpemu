@@ -1513,8 +1513,12 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		var expectedFileProbeMiss =
-			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
-			IsExpectedFileProbeNotFoundNid(nid);
+			IsExpectedFileProbeNotFoundNid(nid) &&
+			(result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND ||
+			 // APR follows the POSIX convention and returns -1 with errno=ENOENT.
+			 // Treat it like the platform-style NOT_FOUND returned by stat/open;
+			 // otherwise large asset-probe batches flood stderr and stall the guest.
+			 (string.Equals(nid, "gEpBkcwxUjw", StringComparison.Ordinal) && resultValue == -1));
 		var expectedTimedWaitTimeout =
 			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
 			unchecked((int)result) == 60;
