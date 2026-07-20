@@ -1540,6 +1540,36 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0x75, 0xEF,
 				0xC3,
 			],
+			// strchr: read-only SysV guest-ABI intrinsic. Keeping this outside
+			// the managed import gateway is safe because it neither writes guest
+			// memory nor participates in scheduler state.
+			"ob5xAW4ln-0" =>
+			[
+				0x8A, 0x07,             // mov al,[rdi]
+				0x40, 0x38, 0xF0,       // cmp al,sil
+				0x74, 0x09,             // je found
+				0x84, 0xC0,             // test al,al
+				0x74, 0x09,             // je not_found
+				0x48, 0xFF, 0xC7,       // inc rdi
+				0xEB, 0xF0,             // jmp scan
+				0x48, 0x89, 0xF8,       // found: mov rax,rdi
+				0xC3,                   // ret
+				0x31, 0xC0,             // not_found: xor eax,eax
+				0xC3,                   // ret
+			],
+			// strrchr: retain the most recent match in rax while scanning to NUL.
+			"9yDWMxEFdJU" =>
+			[
+				0x31, 0xC0,             // xor eax,eax
+				0x8A, 0x17,             // scan: mov dl,[rdi]
+				0x40, 0x38, 0xF2,       // cmp dl,sil
+				0x48, 0x0F, 0x44, 0xC7, // cmove rax,rdi
+				0x84, 0xD2,             // test dl,dl
+				0x74, 0x05,             // je done
+				0x48, 0xFF, 0xC7,       // inc rdi
+				0xEB, 0xEE,             // jmp scan
+				0xC3,                   // done: ret
+			],
 			"8zTFvBIAIN8" =>
 			[
 				0x49, 0x89, 0xF8,

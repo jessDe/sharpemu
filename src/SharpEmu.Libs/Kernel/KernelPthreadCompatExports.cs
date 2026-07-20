@@ -326,6 +326,46 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PosixPthreadMutexUnlock(CpuContext ctx) => PthreadMutexUnlockCore(ctx, ctx[CpuRegister.Rdi], requireOwner: true);
 
+    // Used by the native import leaf dispatcher to avoid installing a
+    // cooperative import-call frame for the overwhelmingly common uncontended
+    // acquisition. Contended and recursive cases deliberately fall back to the
+    // full handler, which preserves waiter ordering and blocking semantics.
+    internal static bool TryPthreadMutexLockUncontended(
+        CpuContext ctx,
+        ulong mutexAddress,
+        out int result)
+    {
+        if (mutexAddress == 0)
+        {
+            result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            return true;
+        }
+
+        if (!TryResolveMutexState(ctx, mutexAddress, createIfZero: true, out var resolvedAddress, out var state))
+        {
+            result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            return true;
+        }
+
+        var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
+        if (!state.TryAcquireUncontended(currentThreadId, allowWaiterBarge: false))
+        {
+            result = default;
+            return false;
+        }
+
+        TracePthreadMutex(
+            ctx,
+            "lock-fast",
+            mutexAddress,
+            resolvedAddress,
+            state,
+            currentThreadId,
+            (int)OrbisGen2Result.ORBIS_GEN2_OK);
+        result = (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return true;
+    }
+
     private static int PthreadGetthreadidCore(CpuContext ctx)
     {
         ctx[CpuRegister.Rax] = KernelPthreadState.GetCurrentThreadUniqueId();

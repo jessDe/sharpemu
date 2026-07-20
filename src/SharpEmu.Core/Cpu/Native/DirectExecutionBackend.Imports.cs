@@ -1347,7 +1347,7 @@ public sealed partial class DirectExecutionBackend
 				$"ret=0x{returnRip:X16}");
 		}
 
-		int returnValue;
+		int returnValue = default;
 		if (importStubEntry.IsNoBlockLeaf)
 		{
 			cpuContext.ClearRaxWriteFlag();
@@ -1359,22 +1359,31 @@ public sealed partial class DirectExecutionBackend
 		}
 		else
 		{
-			var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(
-				returnRip,
-				(ulong)argPackPtr + 104uL,
-				ActiveGuestReturnSlotAddress);
-			try
+			var handledUncontendedMutex = IsPthreadMutexLockNid(importStubEntry.Nid) &&
+				KernelPthreadCompatExports.TryPthreadMutexLockUncontended(cpuContext, arg0, out returnValue);
+			if (!handledUncontendedMutex)
 			{
-				cpuContext.ClearRaxWriteFlag();
-				returnValue = export.Function(cpuContext);
-				if (!cpuContext.WasRaxWritten)
+				var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(
+					returnRip,
+					(ulong)argPackPtr + 104uL,
+					ActiveGuestReturnSlotAddress);
+				try
 				{
-					cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
+					cpuContext.ClearRaxWriteFlag();
+					returnValue = export.Function(cpuContext);
+					if (!cpuContext.WasRaxWritten)
+					{
+						cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
+					}
+				}
+				finally
+				{
+					GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 				}
 			}
-			finally
+			else
 			{
-				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
+				cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
 			}
 		}
 		if (Volatile.Read(ref _pendingGuestExceptionCount) != 0)
@@ -1402,13 +1411,20 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
-		var consumedThreadBlock = GuestThreadExecution.TryConsumeCurrentThreadBlock(
-				out var blockReason,
-				out var blockContinuation,
-				out var hasBlockContinuation,
-				out var blockWakeKey,
-				out var blockWaiter,
-				out var blockDeadlineTimestamp);
+		var blockReason = string.Empty;
+		GuestCpuContinuation blockContinuation = default;
+		var hasBlockContinuation = false;
+		var blockWakeKey = string.Empty;
+		IGuestThreadBlockWaiter? blockWaiter = null;
+		long blockDeadlineTimestamp = 0;
+		var consumedThreadBlock = !importStubEntry.IsNoBlockLeaf &&
+			GuestThreadExecution.TryConsumeCurrentThreadBlock(
+				out blockReason,
+				out blockContinuation,
+				out hasBlockContinuation,
+				out blockWakeKey,
+				out blockWaiter,
+				out blockDeadlineTimestamp);
 		if (consumedThreadBlock &&
 			TryYieldGuestThreadToHostStub(argPackPtr, dispatchIndex, returnRip, importStubEntry.Nid, blockReason))
 		{
@@ -1434,7 +1450,8 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		result = cpuContext[CpuRegister.Rax];
-		if (_activeGuestThreadState is { } completedGuestThreadState)
+		if (_activeGuestThreadState is { } completedGuestThreadState &&
+			(!IsHotDiagnosticLeafImport(importStubEntry.Nid) || (dispatchIndex & 0x3F) == 0))
 		{
 			Volatile.Write(ref completedGuestThreadState.LastImportRax, result);
 			Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
@@ -1450,6 +1467,12 @@ public sealed partial class DirectExecutionBackend
 			"2Z+PpY6CaJg" or // pthread_mutex_unlock
 			"EgmLo6EWgso" or // scePthreadRwlockUnlock
 			"+L98PIbGttk" or // pthread_rwlock_unlock
+			"Q3VBxCXhUHs" or // memcpy
+			"+P6FRGH4LfA" or // memmove
+			"DfivPArhucg" or // memcmp
+			"ob5xAW4ln-0" or // strchr
+			"9yDWMxEFdJU" or // strrchr
+			"8u8lPzUEq+U" or // memchr
 			"EI-5-jlq2dE" or // scePthreadGetthreadid
 			"3eqs37G74-s" or // pthread_getthreadid_np
 			"8XTArSPyWHk" or // sceAudioOut2PortSetAttributes
@@ -1499,6 +1522,11 @@ public sealed partial class DirectExecutionBackend
 			"ob5xAW4ln-0" or // strchr
 			"9yDWMxEFdJU" or // strrchr
 			"8u8lPzUEq+U";   // memchr
+
+	private static bool IsPthreadMutexLockNid(string nid) =>
+		nid is
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo";   // pthread_mutex_lock
 
 	private static bool RequiresVectorImportState(string nid) =>
 		nid is
@@ -1690,6 +1718,9 @@ public sealed partial class DirectExecutionBackend
 			"Q3VBxCXhUHs" or // memcpy
 			"+P6FRGH4LfA" or // memmove
 			"DfivPArhucg" or // memcmp
+			"ob5xAW4ln-0" or // strchr
+			"9yDWMxEFdJU" or // strrchr
+			"8u8lPzUEq+U" or // memchr
 			"ytQULN-nhL4" or // pthread_rwlock_init
 			"6ULAa0fq4jA" or // scePthreadRwlockInit
 			"1471ajPzxh0" or // pthread_rwlock_destroy

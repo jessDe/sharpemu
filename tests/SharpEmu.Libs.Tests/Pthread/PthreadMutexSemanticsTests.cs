@@ -10,6 +10,29 @@ namespace SharpEmu.Libs.Tests.Pthread;
 public sealed class PthreadMutexSemanticsTests
 {
     [Fact]
+    public void UncontendedMutexFastPath_AcquiresAndDefersOwnedCase()
+    {
+        const ulong memoryBase = 0x0FFF_0000;
+        const ulong mutexAddress = memoryBase + 0x100;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        Assert.True(context.TryWriteUInt64(mutexAddress, 1));
+        context[CpuRegister.Rdi] = mutexAddress;
+
+        Assert.True(KernelPthreadCompatExports.TryPthreadMutexLockUncontended(
+            context,
+            mutexAddress,
+            out var result));
+        Assert.Equal(0, result);
+
+        Assert.False(KernelPthreadCompatExports.TryPthreadMutexLockUncontended(
+            context,
+            mutexAddress,
+            out _));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
+    [Fact]
     public void AdaptiveMutex_SelfLockIsIdempotent()
     {
         const ulong memoryBase = 0x1_0000_0000;

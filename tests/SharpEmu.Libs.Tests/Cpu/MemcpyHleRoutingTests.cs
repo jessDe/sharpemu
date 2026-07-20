@@ -100,6 +100,47 @@ public sealed class MemcpyHleRoutingTests
         Assert.True((bool)method.Invoke(null, ["Q2V+iqvjgC0"])!);
     }
 
+    [Theory]
+    [InlineData("ob5xAW4ln-0")] // strchr
+    [InlineData("9yDWMxEFdJU")] // strrchr
+    public void TryCreateNativeImportIntrinsic_ClaimsReadOnlyStringSearches(string nid)
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            return;
+        }
+
+        var claimed = InvokeTryCreateNativeImportIntrinsic(nid, out var address);
+        Assert.True(claimed);
+        Assert.NotEqual(0, address);
+
+        unsafe
+        {
+            Assert.True(HostMemory.Free((void*)address, 0, HostMemory.MEM_RELEASE));
+        }
+    }
+
+    [Theory]
+    [InlineData("Q3VBxCXhUHs")] // memcpy
+    [InlineData("ob5xAW4ln-0")] // strchr
+    [InlineData("9yDWMxEFdJU")] // strrchr
+    public void HotLibcImports_AreNonBlockingLeaves(string nid)
+    {
+        var noBlockMethod = typeof(DirectExecutionBackend).GetMethod(
+            "IsNoBlockLeafImport",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        var leafMethod = typeof(DirectExecutionBackend).GetMethod(
+            "IsLeafImport",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(noBlockMethod);
+        Assert.NotNull(leafMethod);
+
+        var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
+            typeof(DirectExecutionBackend));
+        Assert.True((bool)noBlockMethod.Invoke(null, [nid])!);
+        Assert.True((bool)leafMethod.Invoke(backend, [nid])!);
+    }
+
     private static HashSet<string> ResolveCallees(MethodBase method)
     {
         var il = method.GetMethodBody()?.GetILAsByteArray();
