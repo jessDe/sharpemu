@@ -52,7 +52,27 @@ public enum Gen5PixelOutputKind
 public readonly record struct Gen5PixelOutputBinding(
     uint GuestSlot,
     uint HostLocation,
-    Gen5PixelOutputKind Kind);
+    Gen5PixelOutputKind Kind,
+    uint ComponentSwap = 0);
+
+public static class Gen5ColorComponentSwap
+{
+    public static int GetSourceIndex(uint componentSwap, int destinationComponent)
+    {
+        if ((uint)destinationComponent >= 4)
+        {
+            throw new ArgumentOutOfRangeException(nameof(destinationComponent));
+        }
+
+        return (componentSwap & 3u) switch
+        {
+            1 => destinationComponent switch { 0 => 2, 2 => 0, _ => destinationComponent },
+            2 => 3 - destinationComponent,
+            3 => destinationComponent switch { 0 => 3, 1 => 0, 2 => 1, _ => 2 },
+            _ => destinationComponent,
+        };
+    }
+}
 
 public readonly record struct Gen5ShaderResourceMapping(
     Gen5ShaderResourceKind Kind,

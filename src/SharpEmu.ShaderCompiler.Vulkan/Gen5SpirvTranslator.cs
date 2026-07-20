@@ -326,7 +326,8 @@ public static partial class Gen5SpirvTranslator
         private readonly record struct SpirvPixelOutput(
             uint Variable,
             uint Type,
-            Gen5PixelOutputKind Kind);
+            Gen5PixelOutputKind Kind,
+            uint ComponentSwap);
 
         public CompilationContext(
             Gen5SpirvStage stage,
@@ -1271,7 +1272,11 @@ public static partial class Gen5SpirvTranslator
                         binding.HostLocation);
                     _pixelOutputs.Add(
                         binding.GuestSlot,
-                        new SpirvPixelOutput(variable, outputType, binding.Kind));
+                        new SpirvPixelOutput(
+                            variable,
+                            outputType,
+                            binding.Kind,
+                            binding.ComponentSwap));
                     _interfaces.Add(variable);
                 }
             }
@@ -4339,6 +4344,7 @@ public static partial class Gen5SpirvTranslator
                     };
                 }
 
+                ApplyColorComponentSwap(values, output.ComponentSwap);
                 var vector = _module.AddInstruction(
                     SpirvOp.CompositeConstruct,
                     output.Type,
@@ -4514,6 +4520,20 @@ public static partial class Gen5SpirvTranslator
                 Load(_vec4Type, outputVariable));
             Store(outputVariable, outputValue);
             return true;
+        }
+
+        private static void ApplyColorComponentSwap(uint[] values, uint componentSwap)
+        {
+            // CB_COLOR_INFO.COMP_SWAP describes how logical shader RGBA is
+            // stored in the render target. Vulkan attachment formats do not
+            // carry that state, so apply the equivalent permutation to the
+            // fragment output before the store.
+            var source = (uint[])values.Clone();
+            for (var index = 0; index < values.Length; index++)
+            {
+                values[index] = source[
+                    Gen5ColorComponentSwap.GetSourceIndex(componentSwap, index)];
+            }
         }
 
         private bool PixelExportDebugAddressMatches()

@@ -2744,6 +2744,46 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "n1-v6FgU7MQ",
+        ExportName = "sceKernelConfiguredFlexibleMemorySize",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelConfiguredFlexibleMemorySize(CpuContext ctx)
+    {
+        // The Gen5 ABI supplies the configured and usable-size output slots.
+        // Current SharpEmu memory accounting exposes one flexible-memory pool,
+        // so both values describe that pool rather than leaving caller stack
+        // storage uninitialized.
+        var configuredAddress = ctx[CpuRegister.Rdi];
+        var usableAddress = ctx[CpuRegister.Rsi];
+        if (configuredAddress == 0 ||
+            !ctx.TryWriteUInt64(configuredAddress, FlexibleMemorySizeBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (usableAddress != 0 &&
+            !ctx.TryWriteUInt64(usableAddress, FlexibleMemorySizeBytes))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "tU5e3f9gSiU",
+        ExportName = "sceKernelIsTrinityMode",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsTrinityMode(CpuContext ctx)
+    {
+        // SharpEmu currently presents the base PS5 hardware profile.
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
         Nid = "rTXw65xmLIA",
         ExportName = "sceKernelAllocateDirectMemory",
         Target = Generation.Gen4 | Generation.Gen5,

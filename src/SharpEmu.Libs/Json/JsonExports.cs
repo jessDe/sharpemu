@@ -120,6 +120,14 @@ public static class JsonExports
     }
 
     [SysAbiExport(
+        Nid = "00oCq0RwSAY",
+        ExportName = "_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_",
+        Target = Generation.Gen5,
+        LibraryName = "libSceJson")]
+    public static int InitializerSetGlobalNullAccessCallBack(CpuContext ctx) =>
+        InitializerSetGlobalNullAccessCallback(ctx);
+
+    [SysAbiExport(
         Nid = "WSOuge5IsCg",
         ExportName = "_ZN3sce4Json14InitParameter2C1Ev",
         Target = Generation.Gen5,

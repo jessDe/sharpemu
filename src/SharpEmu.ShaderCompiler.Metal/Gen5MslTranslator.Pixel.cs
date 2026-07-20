@@ -733,10 +733,21 @@ public static partial class Gen5MslTranslator
                 };
             }
 
+            ApplyColorComponentSwap(values, binding.Value.ComponentSwap);
             // A lane removed from EXEC keeps the previous output value; killed
             // fragments are discarded in the epilogue.
             Line($"{field} = exec ? vec<{componentType}, 4>({values[0]}, {values[1]}, {values[2]}, {values[3]}) : {field};");
             return true;
+        }
+
+        private static void ApplyColorComponentSwap(string[] values, uint componentSwap)
+        {
+            var source = (string[])values.Clone();
+            for (var index = 0; index < values.Length; index++)
+            {
+                values[index] = source[
+                    Gen5ColorComponentSwap.GetSourceIndex(componentSwap, index)];
+            }
         }
 
         private bool TryEmitVertexExport(

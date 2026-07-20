@@ -426,7 +426,8 @@ public static partial class AgcExports
         uint Height,
         uint Format,
         uint NumberType,
-        uint TileMode);
+        uint TileMode,
+        uint ComponentSwap = 0);
 
     private sealed record TranslatedGuestDraw(
         ulong ExportShaderAddress,
@@ -6496,14 +6497,16 @@ public static partial class AgcExports
             }
         }
 
-        // Exact packed encoding of the output layout — guest slot (6 bits, CB targets are
-        // 0-7) plus output kind (2 bits) per target, host locations being the sequential
-        // byte positions. Replaces a per-draw LINQ + string build that allocated on every
-        // draw, cache hit or not; the target count disambiguates trailing zero bytes.
+        // Exact packed encoding of the output layout: guest slot (3 bits),
+        // component swap (2 bits), and output kind (2 bits) per target. Host
+        // locations are sequential byte positions. Component swap must be in
+        // the key because it is compiled into the pixel export permutation.
         var outputLayout = 0UL;
         for (var index = 0; index < renderTargets.Length; index++)
         {
-            outputLayout |= (ulong)(((renderTargets[index].Slot & 0x3Fu) << 2) |
+            outputLayout |= (ulong)(
+                ((renderTargets[index].Slot & 0x7u) << 4) |
+                ((renderTargets[index].ComponentSwap & 0x3u) << 2) |
                 (uint)renderTargetOutputKinds[index]) << (index * 8);
         }
 
@@ -6544,7 +6547,8 @@ public static partial class AgcExports
                 pixelOutputs[location] = new Gen5PixelOutputBinding(
                     renderTargets[location].Slot,
                     (uint)location,
-                    renderTargetOutputKinds[location]);
+                    renderTargetOutputKinds[location],
+                    renderTargets[location].ComponentSwap);
             }
 
             if (!GuestGpu.Current.TryCompilePixelShader(
@@ -7231,7 +7235,8 @@ public static partial class AgcExports
                 (attrib2 & 0x3FFFu) + 1,
                 (info >> 2) & 0x1Fu,
                 (info >> 8) & 0x7u,
-                (attrib3 >> 14) & 0x1Fu));
+                (attrib3 >> 14) & 0x1Fu,
+                (info >> 11) & 0x3u));
         }
 
         return targets;
