@@ -187,10 +187,10 @@ public static class FontExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // SceFontVerticalLayout mirrors the three-float horizontal structure:
-        // baseline X, line width, and effect width. The compatibility renderer
-        // uses the same nominal geometry in the transposed direction.
-        var values = new[] { 12.0f, 16.0f, 0.0f };
+        // Baseline (horizontal offset), line advance, decoration extent.
+        // Mirrors the same three-float layout as GetHorizontalLayout, but
+        // interpreted for vertical writing (e.g. CJK text rendered top-to-bottom).
+        var values = new[] { 8.0f, 16.0f, 0.0f };
         for (var index = 0; index < values.Length; index++)
         {
             if (!TryWriteUInt32(

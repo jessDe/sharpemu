@@ -11,8 +11,11 @@ public static class NpWebApi2Exports
     private const int NpWebApi2ErrorInvalidArgument = unchecked((int)0x80553402);
 
     private static int _initialized;
-    private static int _nextUserContextId;
-    private static readonly ConcurrentDictionary<(int LibraryContextId, int UserId), int> UserContexts = new();
+    private static int _nextLibraryContextHandle;
+    private static int _nextPushEventHandle;
+    private static int _nextUserContextHandle = 1000;
+    private static readonly object _contextGate = new();
+    private static readonly HashSet<int> _libraryContexts = [];
 
     [SysAbiExport(
         Nid = "+o9816YQhqQ",
@@ -29,9 +32,10 @@ public static class NpWebApi2Exports
             return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
         }
 
+        var libraryContextId = CreateLibraryContextId();
         Interlocked.Exchange(ref _initialized, 1);
         TraceNpWebApi2("init", httpContextId, poolSize);
-        return ctx.SetReturn(0);
+        return ctx.SetReturn(libraryContextId);
     }
 
     [SysAbiExport(
@@ -41,9 +45,16 @@ public static class NpWebApi2Exports
         LibraryName = "libSceNpWebApi2")]
     public static int NpWebApi2InitializeAlt(CpuContext ctx)
     {
+        var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (!IsValidLibraryContextId(libraryContextId))
+        {
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        var handle = CreatePushEventHandle();
         Interlocked.Exchange(ref _initialized, 1);
-        TraceNpWebApi2("init-alt", unchecked((int)ctx[CpuRegister.Rdi]), ctx[CpuRegister.Rsi]);
-        return ctx.SetReturn(0);
+        TraceNpWebApi2("init-alt", libraryContextId, 0);
+        return ctx.SetReturn(handle);
     }
 
     [SysAbiExport(
@@ -56,15 +67,19 @@ public static class NpWebApi2Exports
         var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
         var userId = unchecked((int)ctx[CpuRegister.Rsi]);
 
-        // A user context is only a local routing handle. It is safe to provide
-        // one without a PSN backend; individual online requests can still report
-        // their offline result. Returning INVALID_ARGUMENT here makes titles
-        // retry context creation every frame and prevents offline startup.
-        var userContextId = UserContexts.GetOrAdd(
-            (libraryContextId, userId),
-            static _ => Interlocked.Increment(ref _nextUserContextId));
-        Interlocked.Exchange(ref _initialized, 1);
-        TraceNpWebApi2("create-user-context", libraryContextId, unchecked((uint)userId));
+        TraceNpWebApi2(
+            "create-user-context",
+            libraryContextId,
+            unchecked((uint)userId));
+
+        if (Volatile.Read(ref _initialized) == 0 ||
+            !IsValidLibraryContextId(libraryContextId) ||
+            userId == -1)
+        {
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        var userContextId = Interlocked.Increment(ref _nextUserContextHandle);
         return ctx.SetReturn(userContextId);
     }
 
@@ -76,10 +91,55 @@ public static class NpWebApi2Exports
     public static int NpWebApi2Terminate(CpuContext ctx)
     {
         var libraryContextId = unchecked((int)ctx[CpuRegister.Rdi]);
-        Interlocked.Exchange(ref _initialized, 0);
-        UserContexts.Clear();
+        if (!IsValidLibraryContextId(libraryContextId))
+        {
+            return ctx.SetReturn(NpWebApi2ErrorInvalidArgument);
+        }
+
+        RemoveLibraryContextId(libraryContextId);
         TraceNpWebApi2("term", libraryContextId, 0);
         return ctx.SetReturn(0);
+    }
+
+    private static int CreateLibraryContextId()
+    {
+        var handle = Interlocked.Increment(ref _nextLibraryContextHandle);
+        lock (_contextGate)
+        {
+            _libraryContexts.Add(handle);
+        }
+
+        return handle;
+    }
+
+    private static int CreatePushEventHandle()
+    {
+        return Interlocked.Increment(ref _nextPushEventHandle);
+    }
+
+    private static bool IsValidLibraryContextId(int libraryContextId)
+    {
+        if (libraryContextId <= 0 || libraryContextId >= 0x8000)
+        {
+            return false;
+        }
+
+        lock (_contextGate)
+        {
+            return _libraryContexts.Contains(libraryContextId);
+        }
+    }
+
+    private static void RemoveLibraryContextId(int libraryContextId)
+    {
+        lock (_contextGate)
+        {
+            _libraryContexts.Remove(libraryContextId);
+            if (_libraryContexts.Count == 0)
+            {
+                Interlocked.Exchange(ref _initialized, 0);
+            }
+        }
     }
 
     private static void TraceNpWebApi2(string operation, int id, ulong arg0)
