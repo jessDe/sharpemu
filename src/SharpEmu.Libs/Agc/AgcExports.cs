@@ -5982,17 +5982,12 @@ public static partial class AgcExports
         // S_SETPC_B64. Compiling that prologue by itself produces valid SPIR-V
         // with no position/attribute exports, so the whole 3D draw disappears.
         // Resolve the exact pair captured by sceAgcUnknownFuseShaderHalves.
+        var exportUserDataScalarRegisterBase = NggUserDataScalarRegisterBase;
         if (hasExportShader)
         {
-            lock (_submitTraceGate)
-            {
-                if (_fusedBackShaderByFrontCode.TryGetValue(
-                        exportShaderAddress,
-                        out var backShaderAddress))
-                {
-                    exportShaderAddress = backShaderAddress;
-                }
-            }
+            exportShaderAddress = ResolveExportShaderForTranslation(
+                exportShaderAddress,
+                out exportUserDataScalarRegisterBase);
         }
         var hasPixelShader = TryGetShaderAddress(
             state.ShRegisters,
@@ -6065,6 +6060,7 @@ public static partial class AgcExports
                 ctx,
                 state,
                 exportShaderAddress,
+                exportUserDataScalarRegisterBase,
                 vertexCount,
                 indexed,
                 depthTarget!,
@@ -6134,6 +6130,7 @@ public static partial class AgcExports
                 ctx,
                 state,
                 exportShaderAddress,
+                exportUserDataScalarRegisterBase,
                 pixelShaderAddress,
                 psInputEna,
                 psInputAddr,
@@ -6400,6 +6397,7 @@ public static partial class AgcExports
             vertexCount,
             hasExportShader,
             exportShaderAddress,
+            exportUserDataScalarRegisterBase,
             hasPixelShader,
             pixelShaderAddress,
             hasPsInputEna,
@@ -6415,6 +6413,7 @@ public static partial class AgcExports
         CpuContext ctx,
         SubmittedDcbState state,
         ulong exportShaderAddress,
+        uint exportUserDataScalarRegisterBase,
         uint vertexCount,
         bool indexed,
         GuestDepthTarget depthTarget,
@@ -6437,7 +6436,7 @@ public static partial class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+                userDataScalarRegisterBase: exportUserDataScalarRegisterBase) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 exportState,
@@ -6617,6 +6616,7 @@ public static partial class AgcExports
         CpuContext ctx,
         SubmittedDcbState state,
         ulong exportShaderAddress,
+        uint exportUserDataScalarRegisterBase,
         ulong pixelShaderAddress,
         uint psInputEna,
         uint psInputAddr,
@@ -6646,7 +6646,7 @@ public static partial class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase))
+                userDataScalarRegisterBase: exportUserDataScalarRegisterBase))
         {
             return false;
         }
@@ -10236,6 +10236,32 @@ public static partial class AgcExports
             : EsUserDataRegister;
     }
 
+    internal static ulong ResolveExportShaderForTranslation(
+        ulong exportShaderAddress,
+        out uint userDataScalarRegisterBase)
+    {
+        userDataScalarRegisterBase = NggUserDataScalarRegisterBase;
+        lock (_submitTraceGate)
+        {
+            if (!_fusedBackShaderByFrontCode.TryGetValue(
+                    exportShaderAddress,
+                    out var backShaderAddress))
+            {
+                return exportShaderAddress;
+            }
+
+            // A merged NGG front half receives user SGPRs after the eight
+            // system SGPRs. The executable back half is entered after that
+            // prologue has remapped its inputs and therefore addresses the
+            // same user data from s0. We compile the back half directly, so
+            // reproduce its entry ABI rather than retaining the front-half
+            // s8 offset (which turns S_LOAD_DWORDX* resource-table reads into
+            // null pointers and fallback descriptors).
+            userDataScalarRegisterBase = 0;
+            return backShaderAddress;
+        }
+    }
+
     private static bool HasShaderResource2(
         IReadOnlyDictionary<uint, uint> registers,
         uint userDataBaseRegister) =>
@@ -10564,6 +10590,7 @@ public static partial class AgcExports
         uint vertexCount,
         bool hasExportShader,
         ulong exportShaderAddress,
+        uint exportUserDataScalarRegisterBase,
         bool hasPixelShader,
         ulong pixelShaderAddress,
         bool hasPsInputEna,
@@ -10657,7 +10684,7 @@ public static partial class AgcExports
                         SelectExportUserDataRegister(state.ShRegisters),
                         out var exportState,
                         out _,
-                        userDataScalarRegisterBase: NggUserDataScalarRegisterBase) &&
+                        userDataScalarRegisterBase: exportUserDataScalarRegisterBase) &&
                     Gen5ShaderTranslator.TryCreateState(
                         ctx,
                         pixelShaderAddress,

@@ -7167,6 +7167,8 @@ internal static unsafe class VulkanVideoPresenter
         {
             GuestImageResource? best = null;
             var bestScore = int.MinValue;
+            var bestExtentDistance = ulong.MaxValue;
+            var bestIsActive = false;
             var guestFormat = GetGuestTextureFormat(texture.Format, texture.NumberType);
 
             void Consider(GuestImageResource candidate, bool isActive)
@@ -7201,15 +7203,29 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     score += 2;
                 }
-                if (isActive)
-                {
-                    score += 1;
-                }
 
-                if (score > bestScore)
+                // Dynamic-resolution render targets can keep the descriptor's
+                // allocation extent while the live image uses the current
+                // render extent. When several same-address variants qualify,
+                // prefer the closest extent before using the active image as
+                // the final tie-breaker. This keeps an older 960x540 image from
+                // outranking the current 1920x1080 image for a 2432x1368 view.
+                var extentDistance = GetGuestImageExtentDistance(
+                    texture.Width,
+                    texture.Height,
+                    candidate.LogicalWidth,
+                    candidate.LogicalHeight);
+                if (score > bestScore ||
+                    (score == bestScore && extentDistance < bestExtentDistance) ||
+                    (score == bestScore &&
+                     extentDistance == bestExtentDistance &&
+                     isActive &&
+                     !bestIsActive))
                 {
                     best = candidate;
                     bestScore = score;
+                    bestExtentDistance = extentDistance;
+                    bestIsActive = isActive;
                 }
             }
 
@@ -7476,24 +7492,59 @@ internal static unsafe class VulkanVideoPresenter
 
         private static bool IsCompatibleGuestImageAlias(
             GuestDrawTexture texture,
-            GuestImageResource guestImage)
+            GuestImageResource guestImage) =>
+            IsCompatibleGuestImageExtent(
+                texture.Width,
+                texture.Height,
+                texture.TileMode,
+                guestImage.LogicalWidth,
+                guestImage.LogicalHeight);
+
+        internal static bool IsCompatibleGuestImageExtent(
+            uint textureWidth,
+            uint textureHeight,
+            uint textureTileMode,
+            uint imageWidth,
+            uint imageHeight)
         {
-            if (guestImage.LogicalWidth == texture.Width &&
-                guestImage.LogicalHeight == texture.Height)
+            if (imageWidth == textureWidth && imageHeight == textureHeight)
             {
                 return true;
             }
 
-            if (texture.TileMode == 0 ||
-                texture.Width == 0 ||
-                texture.Height == 0)
+            if (textureTileMode == 0 ||
+                textureWidth == 0 ||
+                textureHeight == 0 ||
+                imageWidth == 0 ||
+                imageHeight == 0)
             {
                 return false;
             }
 
-            return texture.Width <= guestImage.LogicalWidth &&
-                texture.Height <= guestImage.LogicalHeight;
+            if (textureWidth <= imageWidth && textureHeight <= imageHeight)
+            {
+                return true;
+            }
+
+            // Some games retain a tiled texture descriptor for the maximum
+            // allocation extent while rasterizing the same surface at a lower
+            // dynamic resolution. The guest address and format checks happen
+            // separately; an identical aspect ratio distinguishes this case
+            // from an unrelated overlapping allocation. Sampling the live
+            // Vulkan image then preserves the render-to-texture dependency.
+            return imageWidth < textureWidth &&
+                imageHeight < textureHeight &&
+                (ulong)textureWidth * imageHeight ==
+                (ulong)textureHeight * imageWidth;
         }
+
+        internal static ulong GetGuestImageExtentDistance(
+            uint textureWidth,
+            uint textureHeight,
+            uint imageWidth,
+            uint imageHeight) =>
+            (ulong)Math.Abs((long)textureWidth - imageWidth) +
+            (ulong)Math.Abs((long)textureHeight - imageHeight);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private TextureResource ResolveStorageImageResource(GuestDrawTexture texture)

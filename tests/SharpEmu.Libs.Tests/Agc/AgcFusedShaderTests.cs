@@ -18,6 +18,7 @@ public sealed class AgcFusedShaderTests
     private const ulong FrontRegisters = 0x1600;
     private const ulong BackRegisters = 0x1700;
     private const ulong FrontCode = 0x1234_5678_9A00;
+    private const ulong BackCode = 0x2233_4455_6600;
 
     [Fact]
     public void GetFusedShaderSize_ReportsBackRegisterStorage()
@@ -44,6 +45,7 @@ public sealed class AgcFusedShaderTests
         WriteByte(memory, FrontShader + 0x5C, 4);
         WriteByte(memory, BackShader + 0x5C, 4);
         WriteUInt64(memory, FrontShader + 0x10, FrontCode);
+        WriteUInt64(memory, BackShader + 0x10, BackCode);
         WriteUInt64(memory, FrontShader + 0x20, FrontRegisters);
         WriteUInt64(memory, BackShader + 0x20, BackRegisters);
         WriteUInt64(memory, BackShader + 0x08, 0xDEAD_BEEF);
@@ -78,6 +80,25 @@ public sealed class AgcFusedShaderTests
         Assert.Equal(
             0x5566_7700u | (uint)((FrontCode >> 40) & 0xFF),
             ReadUInt32(memory, ScratchRegisters + 0x1C));
+
+        var resolvedShader = AgcExports.ResolveExportShaderForTranslation(
+            FrontCode,
+            out var userDataScalarRegisterBase);
+        Assert.Equal(BackCode, resolvedShader);
+        Assert.Equal(0u, userDataScalarRegisterBase);
+    }
+
+    [Fact]
+    public void ResolveExportShaderForTranslation_KeepsMergedNggAbiForUnfusedShader()
+    {
+        const ulong unfusedShader = 0x3456_789A_BC00;
+
+        var resolvedShader = AgcExports.ResolveExportShaderForTranslation(
+            unfusedShader,
+            out var userDataScalarRegisterBase);
+
+        Assert.Equal(unfusedShader, resolvedShader);
+        Assert.Equal(8u, userDataScalarRegisterBase);
     }
 
     private static CpuContext Context(
