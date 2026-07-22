@@ -4,11 +4,13 @@
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using SharpEmu.Logging;
 
 namespace SharpEmu.HLE;
 
 public sealed class ModuleManager : IModuleManager
 {
+    private static readonly SharpEmuLogger Log = SharpEmuLog.For("HLE");
     private readonly ConcurrentDictionary<string, Delegate> _dispatchTable = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportTable = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportNameTable = new(StringComparer.Ordinal);
@@ -290,8 +292,24 @@ public sealed class ModuleManager : IModuleManager
         }
 
 
+        if (Log.IsEnabled(LogLevel.Trace))
+        {
+            var rdi = context[CpuRegister.Rdi];
+            var rsi = context[CpuRegister.Rsi];
+            var rdx = context[CpuRegister.Rdx];
+            var rcx = context[CpuRegister.Rcx];
+            var r8 = context[CpuRegister.R8];
+            var r9 = context[CpuRegister.R9];
+            Log.Trace($"Calling HLE {export.LibraryName}:{export.Name} (NID: {nid}) | RDI=0x{rdi:X} RSI=0x{rsi:X} RDX=0x{rdx:X} RCX=0x{rcx:X} R8=0x{r8:X} R9=0x{r9:X}");
+        }
+
         context.ClearRaxWriteFlag();
         int ret = ((SysAbiFunction)function).Invoke(context);
+
+        if (Log.IsEnabled(LogLevel.Trace))
+        {
+            Log.Trace($"HLE {export.LibraryName}:{export.Name} returned 0x{ret:X8}");
+        }
 
         if (!context.WasRaxWritten)
         {

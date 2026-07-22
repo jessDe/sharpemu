@@ -18,6 +18,7 @@ public sealed class SharpEmuLogTests
     [InlineData("None", LogLevel.None)]
     [InlineData("warn", LogLevel.Warning)]
     [InlineData("fatal", LogLevel.Critical)]
+    [InlineData("verbose", LogLevel.Trace)]
     public void TryParseLevelAcceptsDefinedNamesAndAliases(string text, LogLevel expected)
     {
         Assert.True(SharpEmuLog.TryParseLevel(text, out var actual));
@@ -35,5 +36,16 @@ public sealed class SharpEmuLogTests
     {
         Assert.False(SharpEmuLog.TryParseLevel(text, out var level));
         Assert.Equal(default, level);
+    }
+
+    [Fact]
+    public void CycleMinimumLevelChangesLevel()
+    {
+        SharpEmuLog.MinimumLevel = LogLevel.Info;
+        
+        Assert.Equal(LogLevel.Debug, SharpEmuLog.CycleMinimumLevel());
+        Assert.Equal(LogLevel.Trace, SharpEmuLog.CycleMinimumLevel());
+        Assert.Equal(LogLevel.None, SharpEmuLog.CycleMinimumLevel());
+        Assert.Equal(LogLevel.Info, SharpEmuLog.CycleMinimumLevel());
     }
 }

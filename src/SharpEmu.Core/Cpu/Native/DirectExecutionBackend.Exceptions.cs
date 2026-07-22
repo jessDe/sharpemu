@@ -28,6 +28,8 @@ public sealed partial class DirectExecutionBackend
 			return;
 		}
 
+		SetupNativeFaultRecord();
+
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
 			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);

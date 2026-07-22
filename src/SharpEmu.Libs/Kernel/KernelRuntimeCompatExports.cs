@@ -40,7 +40,7 @@ public static class KernelRuntimeCompatExports
     private const int ModuleInfoSegmentSize = 16;
     private const ulong DefaultKernelTscFrequency = 10_000_000UL;
     private const ulong PrtAreaStartAddress = 0x0000001000000000UL;
-    private const ulong PrtAreaSize = 0x000000EC00000000UL;
+    private const ulong PrtAreaSize = 0x000000F000000000UL;
     private const int MapFlagFixed = 0x10;
     private const ulong DefaultVirtualRangeAlignment = 0x4000UL;
     private const int AioInitParamSize = 0x3C;
@@ -752,6 +752,7 @@ public static class KernelRuntimeCompatExports
 
         var effectiveAlignment = alignment == 0 ? DefaultVirtualRangeAlignment : alignment;
         var fixedMapping = (flags & MapFlagFixed) != 0;
+        var requireExactAddress = fixedMapping || IsPrtReservation(requestedAddress, length);
         ulong desiredAddress;
         lock (_stateGate)
         {
@@ -763,8 +764,9 @@ public static class KernelRuntimeCompatExports
         ulong releasedAddress = 0;
         var reusedReleasedRange = !fixedMapping && requestedAddress == 0 &&
             TryTakeReleasedVirtualRange(length, effectiveAlignment, out releasedAddress);
-        var alreadyBacked = fixedMapping && requestedAddress != 0 &&
-            KernelMemoryCompatExports.IsGuestRangeBacked(ctx, requestedAddress, length);
+        var alreadyBacked = ShouldReuseRequestedVirtualRange(
+            requestedAddress,
+            KernelMemoryCompatExports.IsGuestRangeBacked(ctx, requestedAddress, length));
         ulong mappedAddress;
         if (reusedReleasedRange)
         {
@@ -779,9 +781,15 @@ public static class KernelRuntimeCompatExports
                      desiredAddress,
                      length,
                      effectiveAlignment,
-                     allowSearch: !fixedMapping,
+                     allowSearch: !requireExactAddress,
                      out mappedAddress))
         {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (requireExactAddress && mappedAddress != requestedAddress)
+        {
+            // Exact address was requested but not satisfied.
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
@@ -803,6 +811,19 @@ public static class KernelRuntimeCompatExports
 
         KernelMemoryCompatExports.RegisterReservedVirtualRange(mappedAddress, length);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    internal static bool ShouldReuseRequestedVirtualRange(ulong requestedAddress, bool isBacked) =>
+        requestedAddress != 0 && isBacked;
+
+    internal static bool IsPrtReservation(ulong address, ulong length)
+    {
+        if (address < PrtAreaStartAddress || length == 0 || length > PrtAreaSize)
+        {
+            return false;
+        }
+
+        return address - PrtAreaStartAddress <= PrtAreaSize - length;
     }
 
     internal static void RegisterReleasedVirtualRange(ulong address, ulong length)
@@ -1518,6 +1539,20 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelIsNeoMode(CpuContext ctx)
     {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "tU5e3f9gSiU",
+        ExportName = "sceKernelIsTrinityMode",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsTrinityMode(CpuContext ctx)
+    {
+        // SharpEmu currently exposes the base PS5 hardware profile. Trinity
+        // feature selection must therefore remain disabled, matching the AGC
+        // query and avoiding an unsupported enhanced-console render path.
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

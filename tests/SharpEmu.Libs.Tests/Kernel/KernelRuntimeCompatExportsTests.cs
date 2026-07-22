@@ -11,6 +11,17 @@ namespace SharpEmu.Libs.Tests.Kernel;
 // otherwise falls back to the QPC-based Stopwatch, so the frequency selection has to follow suit.
 public sealed class KernelRuntimeCompatExportsTests
 {
+    [Theory]
+    [InlineData(0x000000C000000000UL, 0x0000004000000000UL, true)]
+    [InlineData(0x0000001000000000UL, 0x0000000000004000UL, true)]
+    [InlineData(0x000002B7A1A90000UL, 0x0000004000000000UL, false)]
+    [InlineData(0x0000000FFFFFF000UL, 0x0000000000004000UL, false)]
+    [InlineData(0x000000C000000000UL, 0UL, false)]
+    public void PrtReservationsMustRemainInsidePrtArea(ulong address, ulong length, bool expected)
+    {
+        Assert.Equal(expected, KernelRuntimeCompatExports.IsPrtReservation(address, length));
+    }
+
     private static KernelRuntimeCompatExports.TryGetFrequency Yields(ulong hz) =>
         (out ulong frequencyHz) =>
         {

@@ -125,6 +125,30 @@ public static partial class Gen5SpirvTranslator
                 case "VMovB32":
                     result = GetRawSource(instruction, 0);
                     break;
+                case "VFfbhU32":
+                {
+                    var raw = GetRawSource(instruction, 0);
+                    var mostSignificantBit = Bitcast(
+                        _uintType,
+                        Ext(75, _intType, raw));
+                    var index = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(31),
+                        mostSignificantBit);
+                    var nonzero = _module.AddInstruction(
+                        SpirvOp.INotEqual,
+                        _boolType,
+                        raw,
+                        UInt(0));
+                    result = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        nonzero,
+                        index,
+                        UInt(uint.MaxValue));
+                    break;
+                }
                 case "VWritelaneB32":
                 {
                     // vdst[lane(src1)] = src0
@@ -1637,6 +1661,60 @@ public static partial class Gen5SpirvTranslator
                     : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered);
             }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
+                     (opcode.EndsWith("U64", StringComparison.Ordinal) ||
+                      opcode.EndsWith("I64", StringComparison.Ordinal)))
+            {
+                var left = GetRawSource64(instruction, 0);
+                var right = GetRawSource64(instruction, 1);
+                var operation = opcode switch
+                {
+                    "VCmpEqU64" or "VCmpxEqU64" or
+                    "VCmpEqI64" or "VCmpxEqI64" => SpirvOp.IEqual,
+                    "VCmpNeU64" or "VCmpxNeU64" or
+                    "VCmpNeI64" or "VCmpxNeI64" => SpirvOp.INotEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported 64-bit integer compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode.EndsWith("F16", StringComparison.Ordinal))
+            {
+                var left = Bitcast(
+                    _floatType,
+                    EmitHalfToFloat(GetRawSource(instruction, 0)));
+                var right = Bitcast(
+                    _floatType,
+                    EmitHalfToFloat(GetRawSource(instruction, 1)));
+                var operation = opcode switch
+                {
+                    "VCmpLtF16" or "VCmpxLtF16" => SpirvOp.FOrdLessThan,
+                    "VCmpEqF16" or "VCmpxEqF16" => SpirvOp.FOrdEqual,
+                    "VCmpLeF16" or "VCmpxLeF16" => SpirvOp.FOrdLessThanEqual,
+                    "VCmpGtF16" or "VCmpxGtF16" => SpirvOp.FOrdGreaterThan,
+                    "VCmpLgF16" or "VCmpxLgF16" => SpirvOp.FOrdNotEqual,
+                    "VCmpGeF16" or "VCmpxGeF16" => SpirvOp.FOrdGreaterThanEqual,
+                    "VCmpNeqF16" or "VCmpxNeqF16" => SpirvOp.FUnordNotEqual,
+                    "VCmpNltF16" or "VCmpxNltF16" => SpirvOp.FUnordGreaterThanEqual,
+                    "VCmpNleF16" or "VCmpxNleF16" => SpirvOp.FUnordGreaterThan,
+                    "VCmpNgtF16" or "VCmpxNgtF16" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNgeF16" or "VCmpxNgeF16" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF16" or "VCmpxNlgF16" => SpirvOp.FUnordEqual,
+                    _ => SpirvOp.Nop,
+                };
+                if (operation == SpirvOp.Nop)
+                {
+                    error = $"unsupported half-float compare {opcode}";
+                    return false;
+                }
+
+                condition = _module.AddInstruction(operation, _boolType, left, right);
+            }
+            else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
                      opcode.EndsWith("F32", StringComparison.Ordinal))
             {
                 var left = GetFloatSource(instruction, 0);
@@ -1669,8 +1747,27 @@ public static partial class Gen5SpirvTranslator
             {
                 var left = GetRawSource(instruction, 0);
                 var right = GetRawSource(instruction, 1);
-                var signed = opcode.EndsWith("I32", StringComparison.Ordinal);
-                if (signed)
+                if (opcode.EndsWith("I16", StringComparison.Ordinal))
+                {
+                    left = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, left),
+                        UInt(0),
+                        UInt(16));
+                    right = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, right),
+                        UInt(0),
+                        UInt(16));
+                }
+                else if (opcode.EndsWith("U16", StringComparison.Ordinal))
+                {
+                    left = BitwiseAnd(left, UInt(0xFFFF));
+                    right = BitwiseAnd(right, UInt(0xFFFF));
+                }
+                else if (opcode.EndsWith("I32", StringComparison.Ordinal))
                 {
                     left = Bitcast(_intType, left);
                     right = Bitcast(_intType, right);
@@ -1678,17 +1775,29 @@ public static partial class Gen5SpirvTranslator
 
                 var operation = opcode switch
                 {
+                    "VCmpEqI16" or "VCmpxEqI16" or
+                    "VCmpEqU16" or "VCmpxEqU16" or
                     "VCmpEqI32" or "VCmpxEqI32" or
                     "VCmpEqU32" or "VCmpxEqU32" => SpirvOp.IEqual,
+                    "VCmpNeI16" or "VCmpxNeI16" or
+                    "VCmpNeU16" or "VCmpxNeU16" or
                     "VCmpNeI32" or "VCmpxNeI32" or
                     "VCmpNeU32" or "VCmpxNeU32" => SpirvOp.INotEqual,
+                    "VCmpLtI16" or "VCmpxLtI16" or
                     "VCmpLtI32" or "VCmpxLtI32" => SpirvOp.SLessThan,
+                    "VCmpLeI16" or "VCmpxLeI16" or
                     "VCmpLeI32" or "VCmpxLeI32" => SpirvOp.SLessThanEqual,
+                    "VCmpGtI16" or "VCmpxGtI16" or
                     "VCmpGtI32" or "VCmpxGtI32" => SpirvOp.SGreaterThan,
+                    "VCmpGeI16" or "VCmpxGeI16" or
                     "VCmpGeI32" or "VCmpxGeI32" => SpirvOp.SGreaterThanEqual,
+                    "VCmpLtU16" or "VCmpxLtU16" or
                     "VCmpLtU32" or "VCmpxLtU32" => SpirvOp.ULessThan,
+                    "VCmpLeU16" or "VCmpxLeU16" or
                     "VCmpLeU32" or "VCmpxLeU32" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU16" or "VCmpxGtU16" or
                     "VCmpGtU32" or "VCmpxGtU32" => SpirvOp.UGreaterThan,
+                    "VCmpGeU16" or "VCmpxGeU16" or
                     "VCmpGeU32" or "VCmpxGeU32" => SpirvOp.UGreaterThanEqual,
                     _ => SpirvOp.Nop,
                 };
@@ -1810,7 +1919,7 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode == "SFF1I32B64")
+            if (instruction.Opcode is "SFF1I32B64" or "SBcnt1I32B64")
             {
                 var source = GetRawSource64(instruction, 0);
                 var low = _module.AddInstruction(SpirvOp.UConvert, _uintType, source);
@@ -1818,19 +1927,23 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.UConvert,
                     _uintType,
                     ShiftRightLogical64(source, _module.Constant64(_ulongType, 32)));
-                var ff1Result = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    IsNotZero(low),
-                    Ext(73, _uintType, low),
-                    _module.AddInstruction(
+                var wideResult = instruction.Opcode == "SBcnt1I32B64"
+                    ? IAdd(
+                        _module.AddInstruction(SpirvOp.BitCount, _uintType, low),
+                        _module.AddInstruction(SpirvOp.BitCount, _uintType, high))
+                    : _module.AddInstruction(
                         SpirvOp.Select,
                         _uintType,
-                        IsNotZero(high),
-                        IAdd(UInt(32), Ext(73, _uintType, high)),
-                        UInt(uint.MaxValue)));
-                StoreS(destination, ff1Result);
-                Store(_scc, IsNotZero(ff1Result));
+                        IsNotZero(low),
+                        Ext(73, _uintType, low),
+                        _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            IsNotZero(high),
+                            IAdd(UInt(32), Ext(73, _uintType, high)),
+                            UInt(uint.MaxValue)));
+                StoreS(destination, wideResult);
+                Store(_scc, IsNotZero(wideResult));
                 return true;
             }
 

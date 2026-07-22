@@ -18,6 +18,7 @@ internal static partial class Program
     private static readonly SharpEmuLogger Log = SharpEmuLog.For("SharpEmu.CLI");
     private static readonly object ConsoleMirrorSync = new();
     private static StreamWriter? _consoleMirrorFile;
+    private static Timer? _consoleMirrorFlushTimer;
     private const int DefaultImportTraceLimit = 32;
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
@@ -222,6 +223,36 @@ internal static partial class Program
             return childExitCode;
         }
 
+        var logToggleThread = new Thread(() =>
+        {
+            while (true)
+            {
+                try
+                {
+                    if (Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(intercept: true);
+                        if (key.Key == ConsoleKey.L)
+                        {
+                            var newLevel = SharpEmuLog.CycleMinimumLevel();
+                            Log.Info($"Log level changed to: {newLevel}");
+                        }
+                    }
+                }
+                catch
+                {
+                    // Console might not be available or redirected.
+                }
+
+                Thread.Sleep(100);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "SharpEmu Log Toggle",
+        };
+        logToggleThread.Start();
+
         if (!TryExtractHostSurfaceArgument(args, out var emulatorArgs, out var hostSurface, out var hostSurfaceError))
         {
             Console.Error.WriteLine($"[LOADER][ERROR] {hostSurfaceError}");
@@ -247,6 +278,7 @@ internal static partial class Program
 
         Log.Info(BuildInfo.Banner);
         Log.Info(HostSystemInfo.Summary);
+        Log.Info("Press 'L' to cycle log levels (Info -> Debug -> Trace -> None).");
 
         ebootPath = Path.GetFullPath(ebootPath);
         Console.Error.WriteLine($"[DEBUG] Full path: {ebootPath}");
@@ -852,12 +884,24 @@ internal static partial class Program
                     FileMode.Create,
                     FileAccess.Write,
                     FileShare.ReadWrite,
-                    bufferSize: 4096,
+                    bufferSize: 65536,
                     FileOptions.SequentialScan);
-                _consoleMirrorFile = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+                _consoleMirrorFile = new StreamWriter(
+                    stream,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                    bufferSize: 65536)
                 {
-                    AutoFlush = true,
+                    // Full import tracing can generate millions of lines. An
+                    // AutoFlush after every small Console.Write fragment makes
+                    // the guest wait on disk for every register and mutex call.
+                    // The timer preserves live logs while batching the writes.
+                    AutoFlush = false,
                 };
+                _consoleMirrorFlushTimer = new Timer(
+                    static _ => FlushConsoleFileMirror(),
+                    null,
+                    dueTime: 250,
+                    period: 250);
 
                 Console.SetOut(new TeeTextWriter(Console.Out, _consoleMirrorFile));
                 Console.SetError(new TeeTextWriter(Console.Error, _consoleMirrorFile));
@@ -876,6 +920,8 @@ internal static partial class Program
         {
             try
             {
+                _consoleMirrorFlushTimer?.Dispose();
+                _consoleMirrorFlushTimer = null;
                 _consoleMirrorFile?.Flush();
                 _consoleMirrorFile?.Dispose();
             }
@@ -884,6 +930,22 @@ internal static partial class Program
             }
 
             _consoleMirrorFile = null;
+        }
+    }
+
+    private static void FlushConsoleFileMirror()
+    {
+        lock (ConsoleMirrorSync)
+        {
+            try
+            {
+                _consoleMirrorFile?.Flush();
+            }
+            catch
+            {
+                // The next write or shutdown will report/close a failed sink;
+                // a timer callback must never terminate the process.
+            }
         }
     }
 
@@ -1026,8 +1088,9 @@ internal static partial class Program
     private static void PrintUsage()
     {
         Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] [--debug-server[=host:port]] <path-to-eboot.bin>");
-        Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
+        Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=verbose --log-file ""E:\Games\...\eboot.bin""");
         Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
+        Log.Info("Runtime toggle: Press 'L' in the console to cycle log levels.");
     }
 
     /// <summary>

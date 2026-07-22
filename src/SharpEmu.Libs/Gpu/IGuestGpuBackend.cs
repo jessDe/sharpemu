@@ -203,8 +203,12 @@ internal interface IGuestGpuBackend
     IDisposable EnterGuestQueue(string queueName, ulong submissionId);
 
     /// <summary>Enqueues an action at its exact position in the current guest queue;
-    /// returns its work sequence, or 0 when nothing could be enqueued.</summary>
-    long SubmitOrderedGuestAction(Action action, string debugName);
+    /// optionally publishes completed GPU buffer writes before invoking it; returns
+    /// its work sequence, or 0 when nothing could be enqueued.</summary>
+    long SubmitOrderedGuestAction(
+        Action action,
+        string debugName,
+        bool requiresGuestMemoryVisibility = true);
 
     /// <summary>Preserves sceAgcDcbWaitUntilSafeForRendering in queue order.</summary>
     long SubmitOrderedGuestFlipWait(int videoOutHandle, int displayBufferIndex);

@@ -76,7 +76,8 @@ internal sealed record VulkanComputeGuestDispatch(
 
 internal sealed record VulkanOrderedGuestAction(
     Action Action,
-    string DebugName);
+    string DebugName,
+    bool RequiresGuestMemoryVisibility);
 
 internal sealed record VulkanOrderedGuestFlip(
     long Version,
@@ -1432,14 +1433,20 @@ internal static unsafe class VulkanVideoPresenter
     /// before it. The render thread flushes its open batch and waits for the
     /// corresponding guest fences before invoking the action.
     /// </summary>
-    public static long SubmitOrderedGuestAction(Action action, string debugName)
+    public static long SubmitOrderedGuestAction(
+        Action action,
+        string debugName,
+        bool requiresGuestMemoryVisibility = true)
     {
         ArgumentNullException.ThrowIfNull(action);
         lock (_gate)
         {
             return _closed || _thread is null
                 ? 0
-                : EnqueueGuestWorkLocked(new VulkanOrderedGuestAction(action, debugName));
+                : EnqueueGuestWorkLocked(new VulkanOrderedGuestAction(
+                    action,
+                    debugName,
+                    requiresGuestMemoryVisibility));
         }
     }
 
@@ -2800,6 +2807,7 @@ internal static unsafe class VulkanVideoPresenter
         private string? _pipelineCachePath;
         private bool _pipelineCacheDirty;
         private long _lastPipelineCacheSaveTick;
+        private readonly object _pipelineCacheSaveLock = new();
         private Queue _queue;
         private uint _queueFamilyIndex;
         private SwapchainKHR _swapchain;
@@ -4254,9 +4262,16 @@ internal static unsafe class VulkanVideoPresenter
             // frame, so saving after every slow creation compounds a warm-up
             // hitch into a multi-minute stall. Coalesce all creations into one
             // periodic snapshot; shutdown still forces a final save.
-            if (Environment.TickCount64 - _lastPipelineCacheSaveTick >= 30_000)
+            // Increased interval to 60s and added lock to prevent concurrent saves.
+            if (Environment.TickCount64 - _lastPipelineCacheSaveTick >= 60_000)
             {
-                SavePipelineCache(force: false);
+                lock (_pipelineCacheSaveLock)
+                {
+                    if (Environment.TickCount64 - _lastPipelineCacheSaveTick >= 60_000)
+                    {
+                        SavePipelineCache(force: false);
+                    }
+                }
             }
         }
 
@@ -5213,7 +5228,10 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
-            WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
+            if (work.RequiresGuestMemoryVisibility)
+            {
+                WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
+            }
             work.Action();
             if (_traceVulkanShaderEnabled)
             {

@@ -16,6 +16,12 @@ public interface IGuestAddressSpace : IGuestMemoryAllocator
     ulong AllocateAt(ulong desiredAddress, ulong size, bool executable = true, bool allowAlternative = true);
 
     /// <summary>
+    /// Checks whether a range belongs to the guest address space without
+    /// committing, reading, or otherwise touching its host pages.
+    /// </summary>
+    bool IsAccessible(ulong address, ulong size);
+
+    /// <summary>
     /// Backs an entire fixed-address range, matching the guest's
     /// <c>SCE_KERNEL_MAP_FIXED</c> contract. Unlike <see cref="AllocateAt"/>, which
     /// reserves the range in one all-or-nothing host call, this walks the range and

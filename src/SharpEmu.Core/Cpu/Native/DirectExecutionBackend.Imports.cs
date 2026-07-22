@@ -14,6 +14,7 @@ using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Cpu;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.Logging;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -181,9 +182,24 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][TRACE] Raw sentinel recoveries: {num2} (last import index={importIndex})");
 			_lastReportedRawSentinelRecoveries = num2;
 		}
+		if (Log.IsEnabled(LogLevel.Trace))
+		{
+			var rdi = *(ulong*)argPackPtr;
+			var rsi = *(ulong*)(argPackPtr + 8);
+			var rdx = *(ulong*)(argPackPtr + 16);
+			var rcx = *(ulong*)(argPackPtr + 24);
+			var r8 = *(ulong*)(argPackPtr + 32);
+			var r9 = *(ulong*)(argPackPtr + 40);
+			Log.Trace($"Calling Import {importStubEntry.Export?.LibraryName ?? "libKernel"}:{importStubEntry.Export?.Name ?? importStubEntry.Nid} (index: {importIndex}) | RDI=0x{rdi:X} RSI=0x{rsi:X} RDX=0x{rdx:X} RCX=0x{rcx:X} R8=0x{r8:X} R9=0x{r9:X}");
+		}
+
 		if (importStubEntry.IsLeaf &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
+			if (Log.IsEnabled(LogLevel.Trace))
+			{
+				Log.Trace($"Import {importStubEntry.Export?.Name ?? importStubEntry.Nid} (leaf) returned 0x{leafResult:X}");
+			}
 			return leafResult;
 		}
 
@@ -348,9 +364,9 @@ public sealed partial class DirectExecutionBackend
 			(num >= 900 && num <= 1300) ||
 			PeriodicImportTrace && num % 100000 == 0L ||
 			(importStubEntry.Nid == "tsvEmnenz48" &&
-			 (num <= 256 || PeriodicImportTrace && num % 1000 == 0L)) ||
+			 (num <= 256 || PeriodicImportTrace && num % 10000 == 0L)) ||
 			(importStubEntry.Nid == "rTXw65xmLIA" &&
-			 (num <= 256 || PeriodicImportTrace && num % 128 == 0)) ||
+			 (num <= 256 || PeriodicImportTrace && num % 4096 == 0)) ||
 			flag ||
 			flag2 ||
 			flag3;

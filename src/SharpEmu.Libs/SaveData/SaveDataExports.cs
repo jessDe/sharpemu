@@ -178,13 +178,6 @@ public static class SaveDataExports
     [SysAbiExport(Nid = "xz0YMi6BfNk", ExportName = "sceSaveDataMount5", Target = Generation.Gen5, LibraryName = "libSceSaveData")]
     public static int SaveDataMount5(CpuContext ctx) => SaveDataMount3(ctx);
 
-    [SysAbiExport(
-        Nid = "WAzWTZm1H+I",
-        ExportName = "sceSaveDataTransferringMount",
-        Target = Generation.Gen5,
-        LibraryName = "libSceSaveData")]
-    public static int SaveDataTransferringMount(CpuContext ctx) => SaveDataMount3(ctx);
-
     [SysAbiExport(Nid = "BMR4F-Uek3E", ExportName = "sceSaveDataUmount", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
     public static int SaveDataUmount(CpuContext ctx) => SaveDataUmount2(ctx);
 

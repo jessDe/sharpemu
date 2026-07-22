@@ -17,6 +17,8 @@ public sealed class PthreadMutexSemanticsTests
         var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
         var context = new CpuContext(memory, Generation.Gen5);
         Assert.True(context.TryWriteUInt64(mutexAddress, 1));
+        const ulong guestBookkeeping = 0x1122_3344_5566_7788;
+        Assert.True(context.TryWriteUInt64(mutexAddress + 8, guestBookkeeping));
         context[CpuRegister.Rdi] = mutexAddress;
 
         Assert.True(KernelPthreadCompatExports.TryPthreadMutexLockUncontended(
@@ -30,6 +32,8 @@ public sealed class PthreadMutexSemanticsTests
             mutexAddress,
             out _));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.True(context.TryReadUInt64(mutexAddress + 8, out var preservedBookkeeping));
+        Assert.Equal(guestBookkeeping, preservedBookkeeping);
     }
 
     [Fact]

@@ -368,7 +368,10 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
     public IDisposable EnterGuestQueue(string queueName, ulong submissionId) =>
         MetalVideoPresenter.EnterGuestQueue(queueName, submissionId);
 
-    public long SubmitOrderedGuestAction(Action action, string debugName) =>
+    public long SubmitOrderedGuestAction(
+        Action action,
+        string debugName,
+        bool requiresGuestMemoryVisibility = true) =>
         MetalVideoPresenter.SubmitOrderedGuestAction(action, debugName);
 
     public long SubmitOrderedGuestFlipWait(int videoOutHandle, int displayBufferIndex) =>

@@ -39,6 +39,12 @@ public static class KernelPthreadCompatExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
     private static long _nextSynchronizationWaiterId;
 
+    [ThreadStatic]
+    private static int _pendingFastMutexAcquisitions;
+
+    [ThreadStatic]
+    private static int _completedFastMutexCycles;
+
     private sealed class PthreadMutexState
     {
         private long _ownerThreadId;
@@ -353,6 +359,8 @@ public static class KernelPthreadCompatExports
             result = default;
             return false;
         }
+
+        _pendingFastMutexAcquisitions++;
 
         TracePthreadMutex(
             ctx,
@@ -804,18 +812,18 @@ public static class KernelPthreadCompatExports
 
         if (state.OwnerThreadId == currentThreadId)
         {
-            if (state.Type == MutexTypeRecursive)
-            {
-                state.IncrementRecursion();
-                TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-            }
-
             if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
                 IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
             {
                 TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+            }
+
+            if (state.Type == MutexTypeRecursive)
+            {
+                state.IncrementRecursion();
+                TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
             if (state.Type == MutexTypeAdaptiveNp)
@@ -856,18 +864,18 @@ public static class KernelPthreadCompatExports
         {
             if (state.OwnerThreadId == currentThreadId)
             {
-                if (state.Type == MutexTypeRecursive)
-                {
-                    state.RecursionCount++;
-                    TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-                }
-
                 if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
                     IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
                 {
                     TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+                }
+
+                if (state.Type == MutexTypeRecursive)
+                {
+                    state.RecursionCount++;
+                    TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
 
                 if (state.Type == MutexTypeAdaptiveNp)
@@ -994,6 +1002,7 @@ public static class KernelPthreadCompatExports
                 }
 
                 TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                YieldAfterFastMutexCycle();
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
         }
@@ -1043,7 +1052,29 @@ public static class KernelPthreadCompatExports
         }
 
         TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+        YieldAfterFastMutexCycle();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static void YieldAfterFastMutexCycle()
+    {
+        if (_pendingFastMutexAcquisitions <= 0)
+        {
+            return;
+        }
+
+        _pendingFastMutexAcquisitions--;
+        var cycles = ++_completedFastMutexCycles;
+        if ((cycles & 0xFFF) == 0)
+        {
+            // Sustained polling loops otherwise monopolize a host core and can
+            // starve the guest thread that produces the condition being polled.
+            Thread.Sleep(1);
+        }
+        else if ((cycles & 0xFF) == 0)
+        {
+            Thread.Yield();
+        }
     }
 
     private static int PthreadMutexattrInitCore(CpuContext ctx, ulong attrAddress)
@@ -1868,6 +1899,7 @@ public static class KernelPthreadCompatExports
 
     private static bool IsGuestTrackedSelfLock(CpuContext ctx, ulong mutexAddress, ulong currentThreadId) =>
         KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress + 8, out var guestOwner) &&
+        guestOwner != 0 &&
         guestOwner == currentThreadId;
 
     private static bool CompleteCondWaiterLocked(

@@ -420,53 +420,157 @@ public static class Gen5ShaderTranslator
             return false;
         }
 
-        var instructions = new List<Gen5ShaderInstruction>();
-        var instructionCount = 0;
-        for (uint pc = 0; instructionCount < MaxInstructions;)
+        // Decode only reachable basic blocks. PS5 shaders can terminate a
+        // callable block with S_SETPC_B64/S_SWAPPC_B64 and place constants or
+        // another entry point directly after it. A linear scan mistakes that
+        // unreachable data for opcodes and rejects otherwise valid shaders.
+        var instructions = new SortedDictionary<uint, Gen5ShaderInstruction>();
+        var pendingBlocks = new Stack<uint>();
+        var visited = new HashSet<uint>();
+        pendingBlocks.Push(0);
+        while (pendingBlocks.Count > 0)
         {
-            if (!TryReadUInt32(ctx, address + pc, out var word))
+            var pc = pendingBlocks.Pop();
+            while (true)
             {
-                error = $"read-failed pc=0x{pc:X}";
-                return false;
-            }
-
-            if (!TryDecodeInstruction(
-                    ctx,
-                    address,
-                    pc,
-                    word,
-                    out var encoding,
-                    out var name,
-                    out var sizeDwords,
-                    out error))
-            {
-                return false;
-            }
-
-            var words = new uint[sizeDwords];
-            words[0] = word;
-            for (uint wordIndex = 1; wordIndex < sizeDwords; wordIndex++)
-            {
-                if (!TryReadUInt32(ctx, address + pc + wordIndex * sizeof(uint), out words[wordIndex]))
+                if (instructions.Count >= MaxInstructions)
                 {
-                    error = $"read-failed pc=0x{pc + wordIndex * sizeof(uint):X}";
+                    error =
+                        $"unterminated at pc=0x{pc:X} " +
+                        $"(hit MaxInstructions={MaxInstructions})" +
+                        FormatDecodeTrail(instructions.Values);
                     return false;
                 }
-            }
 
-            instructions.Add(CreateInstruction(pc, encoding, name, words));
-            instructionCount++;
+                if (!visited.Add(pc))
+                {
+                    break;
+                }
 
-            pc += sizeDwords * sizeof(uint);
-            if (string.Equals(name, "SEndpgm", StringComparison.Ordinal))
-            {
-                program = new Gen5ShaderProgram(address, instructions);
-                return true;
+                if (!TryReadUInt32(ctx, address + pc, out var word))
+                {
+                    error = $"read-failed pc=0x{pc:X}";
+                    return false;
+                }
+
+                if (!TryDecodeInstruction(
+                        ctx,
+                        address,
+                        pc,
+                        word,
+                        out var encoding,
+                        out var name,
+                        out var sizeDwords,
+                        out error))
+                {
+                    error =
+                        $"{error} at pc=0x{pc:X} word=0x{word:X8}" +
+                        FormatDecodeTrail(instructions.Values);
+                    return false;
+                }
+
+                var words = new uint[sizeDwords];
+                words[0] = word;
+                for (uint wordIndex = 1; wordIndex < sizeDwords; wordIndex++)
+                {
+                    if (!TryReadUInt32(
+                            ctx,
+                            address + pc + wordIndex * sizeof(uint),
+                            out words[wordIndex]))
+                    {
+                        error =
+                            $"read-failed pc=0x" +
+                            $"{pc + wordIndex * sizeof(uint):X}";
+                        return false;
+                    }
+                }
+
+                instructions[pc] = CreateInstruction(pc, encoding, name, words);
+                var nextPc = pc + sizeDwords * sizeof(uint);
+                if (IsConditionalBranch(name) &&
+                    TryGetBranchTarget(nextPc, word, out var conditionalTarget))
+                {
+                    pendingBlocks.Push(conditionalTarget);
+                }
+
+                if (IsBlockTerminator(name))
+                {
+                    if (!string.Equals(name, "SBranch", StringComparison.Ordinal) ||
+                        !TryGetBranchTarget(nextPc, word, out var branchTarget))
+                    {
+                        break;
+                    }
+
+                    pc = branchTarget;
+                }
+                else
+                {
+                    pc = nextPc;
+                }
             }
         }
 
-        error = "unterminated";
-        return false;
+        if (instructions.Count == 0)
+        {
+            error = "empty";
+            return false;
+        }
+
+        program = new Gen5ShaderProgram(address, instructions.Values.ToArray());
+        return true;
+    }
+
+    private static bool IsBlockTerminator(string name) =>
+        name is "SEndpgm" or "SBranch" or "SSetpcB64" or "SSwappcB64";
+
+    private static bool IsConditionalBranch(string name) =>
+        name is "SCbranchScc0" or
+            "SCbranchScc1" or
+            "SCbranchVccz" or
+            "SCbranchExecz" or
+            "SCbranchVccnz" or
+            "SCbranchExecnz" or
+            "SCbranchCdbgsys";
+
+    private static bool TryGetBranchTarget(uint nextPc, uint word, out uint target)
+    {
+        var byteOffset = (long)(short)(word & 0xFFFFu) * sizeof(uint);
+        var targetPc = nextPc + byteOffset;
+        if (targetPc < 0 || targetPc > uint.MaxValue)
+        {
+            target = 0;
+            return false;
+        }
+
+        target = (uint)targetPc;
+        return true;
+    }
+
+    private static string FormatDecodeTrail(
+        IReadOnlyCollection<Gen5ShaderInstruction> instructions)
+    {
+        if (instructions.Count == 0)
+        {
+            return " trail=[]";
+        }
+
+        var trail = instructions.Skip(Math.Max(0, instructions.Count - 12));
+        var builder = new StringBuilder(" trail=[");
+        var first = true;
+        foreach (var instruction in trail)
+        {
+            if (!first)
+            {
+                builder.Append(", ");
+            }
+
+            first = false;
+            builder.Append($"0x{instruction.Pc:X}:{instruction.Opcode}");
+            builder.Append($"({instruction.Words.Count}dw)");
+        }
+
+        builder.Append(']');
+        return builder.ToString();
     }
 
     [Conditional("DEBUG")]
@@ -695,6 +799,7 @@ public static class Gen5ShaderTranslator
             0x0A => "SWqmB64",
             0x0B => "SBrevB32",
             0x0F => "SBcnt1I32B32",
+            0x10 => "SBcnt1I32B64",
             0x13 => "SFF1I32B32",
             0x14 => "SFF1I32B64",
             0x1D => "SBitset1B32",
@@ -924,6 +1029,7 @@ public static class Gen5ShaderTranslator
             0x36 => "VCosF32",
             0x37 => "VNotB32",
             0x38 => "VBfrevB32",
+            0x39 => "VFfbhU32",
             0x3A => "VFfblB32",
             0x42 => "VMovreldB32",
             0x43 => "VMovrelsB32",
@@ -1050,6 +1156,7 @@ public static class Gen5ShaderTranslator
             0x86 => "VCmpGeI32",
             0x87 => "VCmpTI32",
             0x88 => "VCmpClassF32",
+            0x89 => "VCmpLtI16",
             0x90 => "VCmpxFI32",
             0x91 => "VCmpxLtI32",
             0x92 => "VCmpxEqI32",
@@ -1058,6 +1165,8 @@ public static class Gen5ShaderTranslator
             0x95 => "VCmpxNeI32",
             0x96 => "VCmpxGeI32",
             0x97 => "VCmpxTI32",
+            0xAA => "VCmpEqU16",
+            0xAD => "VCmpNeU16",
             0xC0 => "VCmpFU32",
             0xC1 => "VCmpLtU32",
             0xC2 => "VCmpEqU32",
@@ -1066,6 +1175,9 @@ public static class Gen5ShaderTranslator
             0xC5 => "VCmpNeU32",
             0xC6 => "VCmpGeU32",
             0xC7 => "VCmpTU32",
+            0xC9 => "VCmpLtF16",
+            0xCA => "VCmpEqF16",
+            0xCC => "VCmpGtF16",
             0xD0 => "VCmpxFU32",
             0xD1 => "VCmpxLtU32",
             0xD2 => "VCmpxEqU32",
@@ -1074,6 +1186,10 @@ public static class Gen5ShaderTranslator
             0xD5 => "VCmpxNeU32",
             0xD6 => "VCmpxGeU32",
             0xD7 => "VCmpxTU32",
+            0xD9 => "VCmpxLtF16",
+            0xDC => "VCmpxGtF16",
+            0xE5 => "VCmpNeU64",
+            0xED => "VCmpNeqF16",
             _ => string.Empty,
         };
 

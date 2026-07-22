@@ -26,6 +26,23 @@ public static class SharpEmuLog
         set => _minimumLevel = value;
     }
 
+    public static LogLevel CycleMinimumLevel()
+    {
+        lock (ConfigurationSync)
+        {
+            _minimumLevel = _minimumLevel switch
+            {
+                LogLevel.Info => LogLevel.Debug,
+                LogLevel.Debug => LogLevel.Trace,
+                LogLevel.Trace => LogLevel.None,
+                LogLevel.None => LogLevel.Info,
+                _ => LogLevel.Info,
+            };
+
+            return _minimumLevel;
+        }
+    }
+
     public static ISharpEmuLogSink Sink
     {
         get
@@ -125,6 +142,12 @@ public static class SharpEmuLog
         if (string.Equals(normalized, "fatal", StringComparison.OrdinalIgnoreCase))
         {
             level = LogLevel.Critical;
+            return true;
+        }
+
+        if (string.Equals(normalized, "verbose", StringComparison.OrdinalIgnoreCase))
+        {
+            level = LogLevel.Trace;
             return true;
         }
 

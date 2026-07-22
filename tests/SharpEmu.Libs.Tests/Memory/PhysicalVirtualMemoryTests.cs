@@ -3,7 +3,9 @@
 
 using SharpEmu.Core.Memory;
 using SharpEmu.Core.Loader;
+using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
+using SharpEmu.Libs.Kernel;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Memory;
@@ -163,6 +165,102 @@ public sealed class PhysicalVirtualMemoryTests
         // reuses first's base address.
         Assert.True(memory.TryAllocateGuestMemory(0x000F_F000, 0x1000, out var coalesced));
         Assert.Equal(first, coalesced);
+    }
+
+    // 5. Huge exact allocations (e.g. the 768 GiB PRT window beginning at
+    //    0x1000000000) must remain tracked even when the host cannot reserve the
+    //    whole window contiguously. Pages are reserved and committed on demand.
+    [Fact]
+    public void HugeExactAllocationIsReservedAtRequestedAddressWithoutFullCommit()
+    {
+        using var memory = new PhysicalVirtualMemory(new CommitLimitedHostMemory());
+
+        const ulong prtBase = 0x10_0000_0000;
+        const ulong prtSize = 0xC0_0000_0000; // 768 GiB
+
+        Assert.True(memory.TryAllocateAtOrAbove(prtBase, prtSize, executable: false, alignment: 0x20_0000, out var actual));
+        Assert.Equal(prtBase, actual);
+    }
+
+    [Fact]
+    public void BackingCheckInsideHugeLazyRangeDoesNotCommitProbePages()
+    {
+        var host = new CommitLimitedHostMemory();
+        using var memory = new PhysicalVirtualMemory(host);
+
+        const ulong prtBase = 0x10_0000_0000;
+        const ulong prtSize = 0xC0_0000_0000;
+        const ulong mappingBase = 0x30_0000_0000;
+
+        Assert.True(memory.TryAllocateAtOrAbove(prtBase, prtSize, executable: false, alignment: 0x20_0000, out _));
+        var context = new CpuContext(memory, Generation.Gen5);
+        var commitsBeforeBackingCheck = host.CommitCalls;
+
+        Assert.True(KernelMemoryCompatExports.IsGuestRangeBacked(context, mappingBase, 0x40000));
+        Assert.Equal(commitsBeforeBackingCheck, host.CommitCalls);
+    }
+
+    [Fact]
+    public void ExplicitNonFixedReservationCanReuseBackedRequestedAddress()
+    {
+        const ulong prtBase = 0x10_0000_0000;
+
+        Assert.True(KernelRuntimeCompatExports.ShouldReuseRequestedVirtualRange(prtBase, isBacked: true));
+        Assert.False(KernelRuntimeCompatExports.ShouldReuseRequestedVirtualRange(0, isBacked: true));
+        Assert.False(KernelRuntimeCompatExports.ShouldReuseRequestedVirtualRange(prtBase, isBacked: false));
+    }
+
+    [Fact]
+    public void CommittedNoAccessPageRequiresProtectionRestoreBeforeGuestCopy()
+    {
+        Assert.True(PhysicalVirtualMemory.NeedsCommittedProtectionRestore(HostPageProtection.NoAccess));
+        Assert.False(PhysicalVirtualMemory.NeedsCommittedProtectionRestore(HostPageProtection.ReadWrite));
+    }
+
+    // Simulates a Windows host whose commit limit is smaller than the request:
+    // full-commit Allocate fails for anything > 4 GiB and a contiguous host
+    // reservation is unavailable, requiring sparse on-demand backing.
+    private sealed class CommitLimitedHostMemory : IHostMemory
+    {
+        private const ulong CommitLimit = 4UL << 30;
+
+        public int CommitCalls { get; private set; }
+
+        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection) =>
+            size > CommitLimit ? 0 : (desiredAddress != 0 ? desiredAddress : 0x00007000_0000_0000);
+
+        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection) =>
+            size > CommitLimit ? 0 : (desiredAddress != 0 ? desiredAddress : 0x00007000_0000_0000);
+
+        public bool Commit(ulong address, ulong size, HostPageProtection protection)
+        {
+            CommitCalls++;
+            return size <= CommitLimit;
+        }
+
+        public bool Free(ulong address) => true;
+
+        public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool ProtectRaw(ulong address, ulong size, uint rawProtection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool Query(ulong address, out HostRegionInfo info)
+        {
+            info = default;
+            return false;
+        }
+
+        public void FlushInstructionCache(ulong address, ulong size)
+        {
+        }
     }
 
     /// <summary>

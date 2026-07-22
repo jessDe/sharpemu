@@ -2446,7 +2446,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe nint CreateExceptionHandlerTrampoline(nint managedHandler)
 	{
-		const uint stubSize = 256u;
+		const uint stubSize = 1024u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
 		if (ptr == null)
 		{
@@ -2455,6 +2455,36 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		EmitNativeFaultRecordCapture(code, ref offset);
+		// Do not reverse-P/Invoke into managed code for exceptions owned by the
+		// CLR or the host C++ runtime. These can be raised while the current
+		// thread is already in cooperative GC mode; entering VectoredHandler in
+		// that state makes the runtime terminate the process before either our
+		// VEH diagnostics or the top-level filter can run. Stack overflow and
+		// fast-fail are likewise unsafe to service on a managed callback.
+		ReadOnlySpan<uint> passThroughExceptionCodes =
+			[0xE0434352u, MSVC_CPP_EXCEPTION, 0xC0000409u, 0xC00000FDu];
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [rcx]
+		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x00); // mov eax, [rax]
+		var passJumpOffsets = stackalloc int[passThroughExceptionCodes.Length];
+		for (var i = 0; i < passThroughExceptionCodes.Length; i++)
+		{
+			EmitByte(code, ref offset, 0x3D); // cmp eax, imm32
+			EmitUInt32(code, ref offset, passThroughExceptionCodes[i]);
+			EmitByte(code, ref offset, 0x74); // je passThrough
+			passJumpOffsets[i] = offset;
+			EmitByte(code, ref offset, 0x00);
+		}
+		EmitByte(code, ref offset, 0xEB); EmitByte(code, ref offset, 0x03); // jmp handlerBody
+		var passThroughExceptionOffset = offset;
+		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0); // xor eax, eax
+		EmitByte(code, ref offset, 0xC3); // ret (EXCEPTION_CONTINUE_SEARCH)
+		for (var i = 0; i < passThroughExceptionCodes.Length; i++)
+		{
+			code[passJumpOffsets[i]] = checked((byte)(
+				passThroughExceptionOffset - (passJumpOffsets[i] + 1)));
+		}
+
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x54); // push r12
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x55); // push r13
 		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov r12, rsp
@@ -2589,7 +2619,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
         // Large Gen5 executables can keep valid code well past the first 32 MiB.
         // Astro Bot, for example, has an FS:[0] TLS load near +0x70A0000.
         const ulong MaxScanBytes = 134217728uL;
-		ulong num = _entryPoint;
+		ulong allocationBase = 0;
+		if (VirtualQuery((void*)_entryPoint, out var entryRegion, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
+		{
+			allocationBase = entryRegion.AllocationBase;
+		}
+		ulong num = ResolveTlsScanStart(_entryPoint, allocationBase, MaxScanBytes);
 		ulong num2 = num + MaxScanBytes;
 		int num3 = 0;
 		int num4 = 0;
@@ -2640,6 +2675,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num = num6 > num ? num6 : num + 4096uL;
 		}
 		Console.Error.WriteLine($"[LOADER][INFO] Patched {num3} TLS loads, {num9} TLS stores, {num4} stack-canary accesses, {sse4aPatchCount} SSE4a EXTRQ blends");
+	}
+
+	internal static ulong ResolveTlsScanStart(ulong entryPoint, ulong allocationBase, ulong maxScanBytes)
+	{
+		return allocationBase != 0 && allocationBase <= entryPoint && entryPoint - allocationBase < maxScanBytes
+			? allocationBase
+			: entryPoint;
 	}
 
 	private unsafe bool TryPatchSse4aExtrqBlend(nint address, byte* source)
@@ -6441,6 +6483,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			VirtualFree((void*)_unhandledFilterStub, 0u, 32768u);
 			_unhandledFilterStub = 0;
 		}
+		DisposeNativeFaultRecord();
 		if (_handlerHandle.IsAllocated)
 		{
 			_handlerHandle.Free();

@@ -183,6 +183,17 @@ public static partial class AgcExports
     private const ulong ShaderNumOutputSemanticsOffset = 0x56;
     private const ulong ShaderTypeOffset = 0x5A;
     private const ulong ShaderNumShRegistersOffset = 0x5C;
+    private const uint ShaderStructSize = 96;
+    private const ulong ShaderRegisterSize = 8;
+    private const ulong ShaderRegisterAlign = 4;
+    private const byte ShaderTypeGs = 2;
+    private const byte ShaderTypeHs = 3;
+    private const byte ShaderTypeGsFront = 4;
+    private const byte ShaderTypeHsFront = 5;
+    private const byte ShaderTypeGsBack = 6;
+    private const byte ShaderTypeHsBack = 7;
+    private const uint Graphics5ErrorInvalidShaderHalves = 2322333704u;
+    private const uint SpiShaderPgmChksumGs = 0x80;
     private const ulong CommandBufferCursorUpOffset = 0x10;
     private const ulong CommandBufferCursorDownOffset = 0x18;
     private const ulong CommandBufferCallbackOffset = 0x20;
@@ -235,6 +246,7 @@ public static partial class AgcExports
         (ulong Es, ulong State, ulong AliasAlignment),
         IGuestCompiledShader> _depthOnlyVertexShaderCache = new();
     private static readonly Dictionary<ulong, ulong> _shaderHeadersByCode = new();
+    private static readonly Dictionary<ulong, ulong> _fusedBackShaderByFrontCode = new();
     private static readonly ConcurrentDictionary<ulong, byte> _arrayUploadUnsupported = new();
     private static readonly bool _traceAgc = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
@@ -749,6 +761,288 @@ public static partial class AgcExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    #pragma warning disable SHEM006
+    [SysAbiExport(
+        Nid = "dolOmWH+huQ",
+        ExportName = "sceAgcUnknownGetFusedShaderSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetFusedShaderSize(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        var frontShaderAddress = ctx[CpuRegister.Rsi];
+        var backShaderAddress = ctx[CpuRegister.Rdx];
+        if (outputAddress == 0 || frontShaderAddress == 0 || backShaderAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryReadByte(ctx, frontShaderAddress + ShaderTypeOffset, out var frontType) ||
+            !TryReadByte(ctx, backShaderAddress + ShaderTypeOffset, out var backType) ||
+            !TryReadByte(ctx, backShaderAddress + ShaderNumShRegistersOffset, out var registerCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!AreValidShaderHalves(frontType, backType))
+        {
+            return SetAgcReturn(ctx, Graphics5ErrorInvalidShaderHalves);
+        }
+
+        var byteCount = (ulong)registerCount * ShaderRegisterSize;
+        if (!ctx.TryWriteUInt64(outputAddress, byteCount) ||
+            !ctx.TryWriteUInt64(outputAddress + sizeof(ulong), ShaderRegisterAlign))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc(
+            $"agc.get_fused_shader_size front=0x{frontShaderAddress:X16} " +
+            $"back=0x{backShaderAddress:X16} size=0x{byteCount:X} align={ShaderRegisterAlign}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "fd5Bp5tGTgo",
+        ExportName = "sceAgcUnknownFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int FuseShaderHalves(CpuContext ctx)
+    {
+        var fusedShaderAddress = ctx[CpuRegister.Rdi];
+        var frontShaderAddress = ctx[CpuRegister.Rsi];
+        var backShaderAddress = ctx[CpuRegister.Rdx];
+        var scratchRegistersAddress = ctx[CpuRegister.Rcx];
+        if (fusedShaderAddress == 0 || frontShaderAddress == 0 || backShaderAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryReadByte(ctx, frontShaderAddress + ShaderTypeOffset, out var frontType) ||
+            !TryReadByte(ctx, backShaderAddress + ShaderTypeOffset, out var backType))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!AreValidShaderHalves(frontType, backType))
+        {
+            return SetAgcReturn(ctx, Graphics5ErrorInvalidShaderHalves);
+        }
+
+        var geometryShader = frontType == ShaderTypeGsFront;
+        if (!TryCopyGuestMemory(ctx, backShaderAddress, fusedShaderAddress, ShaderStructSize) ||
+            !TryWriteByte(
+                ctx,
+                fusedShaderAddress + ShaderTypeOffset,
+                geometryShader ? ShaderTypeGs : ShaderTypeHs))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!TryReadUInt64(ctx, frontShaderAddress + ShaderSpecialsOffset, out var frontSpecials) ||
+            !TryReadUInt64(ctx, backShaderAddress + ShaderSpecialsOffset, out var backSpecials))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (frontSpecials != 0 && backSpecials != 0)
+        {
+            const ulong shaderStageFlagsOffset = 12;
+            if (!TryReadUInt32(ctx, frontSpecials + shaderStageFlagsOffset, out var frontFlags) ||
+                !TryReadUInt32(ctx, backSpecials + shaderStageFlagsOffset, out var backFlags))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var stageMask = geometryShader ? 0x0040_0000u : 0x0020_0000u;
+            if (((frontFlags ^ backFlags) & stageMask) != 0)
+            {
+                return SetAgcReturn(ctx, Graphics5ErrorInvalidShaderHalves);
+            }
+        }
+
+        if (!TryReadByte(ctx, backShaderAddress + ShaderNumShRegistersOffset, out var backRegisterCount) ||
+            !TryReadUInt64(ctx, backShaderAddress + ShaderShRegistersOffset, out var backRegistersAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var fusedRegistersAddress = backRegistersAddress;
+        if (scratchRegistersAddress != 0 && backRegistersAddress != 0 && backRegisterCount != 0)
+        {
+            var byteCount = (uint)((ulong)backRegisterCount * ShaderRegisterSize);
+            if (!TryCopyGuestMemory(ctx, backRegistersAddress, scratchRegistersAddress, byteCount) ||
+                !ctx.TryWriteUInt64(fusedShaderAddress + ShaderShRegistersOffset, scratchRegistersAddress))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            fusedRegistersAddress = scratchRegistersAddress;
+        }
+
+        if (!TryReadByte(ctx, frontShaderAddress + ShaderNumShRegistersOffset, out var frontRegisterCount) ||
+            !TryReadUInt64(ctx, frontShaderAddress + ShaderShRegistersOffset, out var frontRegistersAddress) ||
+            !TryReadUInt64(ctx, frontShaderAddress + ShaderCodeOffset, out var frontCodeAddress) ||
+            !TryReadUInt64(ctx, backShaderAddress + ShaderCodeOffset, out var backCodeAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (geometryShader)
+        {
+            for (uint occurrence = 0; occurrence < 2; occurrence++)
+            {
+                if (TryFindShaderRegister(
+                        ctx,
+                        fusedRegistersAddress,
+                        backRegisterCount,
+                        SpiShaderPgmChksumGs,
+                        occurrence,
+                        out var fusedRegisterAddress) &&
+                    TryFindShaderRegister(
+                        ctx,
+                        frontRegistersAddress,
+                        frontRegisterCount,
+                        SpiShaderPgmChksumGs,
+                        occurrence,
+                        out var frontRegisterAddress) &&
+                    (!TryReadUInt32(ctx, frontRegisterAddress + sizeof(uint), out var value) ||
+                     !TryWriteUInt32(ctx, fusedRegisterAddress + sizeof(uint), value)))
+                {
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+            }
+
+            if (!TryPatchShaderRegisterAddress(
+                    ctx,
+                    fusedRegistersAddress,
+                    backRegisterCount,
+                    SpiShaderPgmLoEs,
+                    frontCodeAddress))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+        else if (!TryPatchShaderRegisterAddress(
+                     ctx,
+                     fusedRegistersAddress,
+                     backRegisterCount,
+                     SpiShaderPgmLoLs,
+                     frontCodeAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (!ctx.TryWriteUInt64(fusedShaderAddress + ShaderUserDataOffset, 0))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (geometryShader && frontCodeAddress != 0 && backCodeAddress != 0)
+        {
+            lock (_submitTraceGate)
+            {
+                _fusedBackShaderByFrontCode[frontCodeAddress] = backCodeAddress;
+            }
+        }
+
+        TraceAgc(
+            $"agc.fuse_shader_halves fused=0x{fusedShaderAddress:X16} " +
+            $"front=0x{frontShaderAddress:X16} back=0x{backShaderAddress:X16} " +
+            $"scratch=0x{scratchRegistersAddress:X16} geometry={geometryShader}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool AreValidShaderHalves(byte frontType, byte backType) =>
+        (frontType == ShaderTypeGsFront && backType == ShaderTypeGsBack) ||
+        (frontType == ShaderTypeHsFront && backType == ShaderTypeHsBack);
+
+    private static bool TryFindShaderRegister(
+        CpuContext ctx,
+        ulong registersAddress,
+        byte registerCount,
+        uint registerOffset,
+        uint occurrence,
+        out ulong registerAddress)
+    {
+        registerAddress = 0;
+        if (registersAddress == 0)
+        {
+            return false;
+        }
+
+        for (uint index = 0; index < registerCount; index++)
+        {
+            var candidateAddress = registersAddress + (index * ShaderRegisterSize);
+            if (!TryReadUInt32(ctx, candidateAddress, out var candidateOffset))
+            {
+                return false;
+            }
+
+            if (candidateOffset == registerOffset)
+            {
+                if (occurrence == 0)
+                {
+                    registerAddress = candidateAddress;
+                    return true;
+                }
+
+                occurrence--;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryPatchShaderRegisterAddress(
+        CpuContext ctx,
+        ulong registersAddress,
+        byte registerCount,
+        uint lowRegisterOffset,
+        ulong address)
+    {
+        if (!TryFindShaderRegister(
+                ctx,
+                registersAddress,
+                registerCount,
+                lowRegisterOffset,
+                0,
+                out var lowRegisterAddress))
+        {
+            return true;
+        }
+
+        var highRegisterAddress = lowRegisterAddress + ShaderRegisterSize;
+        if (highRegisterAddress + ShaderRegisterSize >
+            registersAddress + ((ulong)registerCount * ShaderRegisterSize))
+        {
+            return true;
+        }
+
+        if (!TryReadUInt32(ctx, highRegisterAddress, out var highRegisterOffset))
+        {
+            return false;
+        }
+
+        if (highRegisterOffset != lowRegisterOffset + 1)
+        {
+            return true;
+        }
+
+        if (!TryReadUInt32(ctx, highRegisterAddress + sizeof(uint), out var highValue))
+        {
+            return false;
+        }
+
+        var lowValue = (uint)(address >> 8);
+        highValue = (highValue & 0xFFFF_FF00u) | (uint)((address >> 40) & 0xFF);
+        return TryWriteUInt32(ctx, lowRegisterAddress + sizeof(uint), lowValue) &&
+               TryWriteUInt32(ctx, highRegisterAddress + sizeof(uint), highValue);
+    }
+    #pragma warning restore SHEM006
 
     [SysAbiExport(
         Nid = "vcmNN+AAXnY",
@@ -2992,7 +3286,8 @@ public static partial class AgcExports
         // timer, which can wake Unity while its upload data is still stale.
         if (GuestGpu.Current.SubmitOrderedGuestAction(
                 TriggerCompletionEvents,
-                $"agc submit completion {submissionId}") == 0)
+                $"agc submit completion {submissionId}",
+                requiresGuestMemoryVisibility: false) == 0)
         {
             TriggerCompletionEvents();
         }
@@ -3790,7 +4085,8 @@ public static partial class AgcExports
             // writes; it fences those writes before publishing the producer.
             if (GuestGpu.Current.SubmitOrderedGuestAction(
                     CompleteAndWake,
-                    $"{debugName} completion") == 0)
+                    $"{debugName} completion",
+                    requiresGuestMemoryVisibility: false) == 0)
             {
                 CompleteAndWake();
             }
@@ -5681,6 +5977,23 @@ public static partial class AgcExports
             SpiShaderPgmLoEs,
             SpiShaderPgmHiEs,
             out var exportShaderAddress);
+        // A fused GFX10 NGG program binds a short ES front-half that only
+        // prepares LDS and tail-calls the executable GS back-half with
+        // S_SETPC_B64. Compiling that prologue by itself produces valid SPIR-V
+        // with no position/attribute exports, so the whole 3D draw disappears.
+        // Resolve the exact pair captured by sceAgcUnknownFuseShaderHalves.
+        if (hasExportShader)
+        {
+            lock (_submitTraceGate)
+            {
+                if (_fusedBackShaderByFrontCode.TryGetValue(
+                        exportShaderAddress,
+                        out var backShaderAddress))
+                {
+                    exportShaderAddress = backShaderAddress;
+                }
+            }
+        }
         var hasPixelShader = TryGetShaderAddress(
             state.ShRegisters,
             SpiShaderPgmLoPs,
@@ -6498,16 +6811,13 @@ public static partial class AgcExports
             }
         }
 
-        // Exact packed encoding of the output layout: guest slot (3 bits),
-        // component swap (2 bits), and output kind (2 bits) per target. Host
-        // locations are sequential byte positions. Component swap must be in
-        // the key because it is compiled into the pixel export permutation.
+        // Match the reference build's packed output layout: six guest-slot
+        // bits followed by the two-bit output kind for each host attachment.
         var outputLayout = 0UL;
         for (var index = 0; index < renderTargets.Length; index++)
         {
             outputLayout |= (ulong)(
-                ((renderTargets[index].Slot & 0x7u) << 4) |
-                ((renderTargets[index].ComponentSwap & 0x3u) << 2) |
+                ((renderTargets[index].Slot & 0x3Fu) << 2) |
                 (uint)renderTargetOutputKinds[index]) << (index * 8);
         }
 
@@ -6548,8 +6858,7 @@ public static partial class AgcExports
                 pixelOutputs[location] = new Gen5PixelOutputBinding(
                     renderTargets[location].Slot,
                     (uint)location,
-                    renderTargetOutputKinds[location],
-                    renderTargets[location].ComponentSwap);
+                    renderTargetOutputKinds[location]);
             }
 
             if (!GuestGpu.Current.TryCompilePixelShader(
@@ -11303,6 +11612,12 @@ public static partial class AgcExports
         return (int)result;
     }
 
+    private static int SetAgcReturn(CpuContext ctx, uint result)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
+        return unchecked((int)result);
+    }
+
     private static uint Pm4(uint lengthDwords, uint op, uint register) =>
         0xC0000000u |
         ((((ushort)lengthDwords - 2u) & 0x3FFFu) << 16) |
@@ -11323,6 +11638,13 @@ public static partial class AgcExports
 
         value = buffer[0];
         return true;
+    }
+
+    private static bool TryWriteByte(CpuContext ctx, ulong address, byte value)
+    {
+        Span<byte> buffer = stackalloc byte[1];
+        buffer[0] = value;
+        return ctx.Memory.TryWrite(address, buffer);
     }
 
     // A submitted command buffer is bulk-copied once per submit and served

@@ -157,6 +157,9 @@ public sealed class Gen5ShaderAtomicDecodeTests
         var ff1B64 = DecodeSingle(0xBEEB147E);
         Assert.Equal("SFF1I32B64", ff1B64.Opcode);
 
+        var bcnt1B64 = DecodeSingle(0xBEEB106A);
+        Assert.Equal("SBcnt1I32B64", bcnt1B64.Opcode);
+
         // SOPC op 0x13, s[0:1] != s[2:3].
         var compare64 = DecodeSingle(0xBF130200);
         Assert.Equal("SCmpLgU64", compare64.Opcode);

@@ -4848,6 +4848,11 @@ public static partial class KernelMemoryCompatExports
             return false;
         }
 
+        if (KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace))
+        {
+            return addressSpace.IsAccessible(address, length);
+        }
+
         Span<byte> probe = stackalloc byte[1];
         return ctx.Memory.TryRead(address, probe) &&
                ctx.Memory.TryRead(address + length - 1, probe);
@@ -5068,58 +5073,6 @@ public static partial class KernelMemoryCompatExports
         string guestPath,
         out string hostPath,
         out bool mountPrefixMatched)
-    // Some retail titles list system/licensed font weights in font_settings.xml
-    // without shipping every file in the extracted package. A real console can
-    // satisfy those dependencies from system content. Keep the workaround
-    // deliberately exact and local to the title's common font directory, and
-    // only substitute a compatible font which the title did ship.
-    private static string ResolveKnownMissingTitleAssetFallback(string guestPath, string resolvedPath)
-    {
-        if (File.Exists(resolvedPath))
-        {
-            return resolvedPath;
-        }
-
-        var normalizedGuestPath = guestPath.Replace('\\', '/');
-        const string fontDirectory = "/app0/data/common/font/";
-        if (!normalizedGuestPath.StartsWith(fontDirectory, StringComparison.OrdinalIgnoreCase) ||
-            normalizedGuestPath[fontDirectory.Length..].Contains('/'))
-        {
-            return resolvedPath;
-        }
-
-        var missingFont = normalizedGuestPath[fontDirectory.Length..];
-        var fallbackFont = missingFont.ToUpperInvariant() switch
-        {
-            "SIE-SHINGOPR6N-HEAVY.OTF" => "LevelNameFont_JP.otf",
-            "FUTURANOWTEXT-BD.OTF" => "FuturaNowText-XBd.otf",
-            "FUTURANOWTEXT-BLK.OTF" => "FuturaNowText-XBd.otf",
-            "FUTURASTD-BOOK.OTF" => "FuturaStd-Bold.otf",
-            "FUTURASTD-CONDENSED.OTF" => "FuturaStd-Bold.otf",
-            "FUTURASTD-CONDENSEDLIGHT.OTF" => "FuturaStd-Bold.otf",
-            "FUTURASTD-LIGHT.OTF" => "FuturaStd-Bold.otf",
-            "FUTURASTD-MEDIUM.OTF" => "FuturaStd-Bold.otf",
-            "HEISEIMARUGO.TTF" => "LevelNameFont_JP.otf",
-            "MOHR-LIGHTIT.OTF" => "LevelNameFont.otf",
-            _ => null,
-        };
-
-        if (fallbackFont is null)
-        {
-            return resolvedPath;
-        }
-
-        var directory = Path.GetDirectoryName(resolvedPath);
-        if (string.IsNullOrWhiteSpace(directory))
-        {
-            return resolvedPath;
-        }
-
-        var fallbackPath = Path.Combine(directory, fallbackFont);
-        return File.Exists(fallbackPath) ? fallbackPath : resolvedPath;
-    }
-
-    private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
     {
         hostPath = string.Empty;
         mountPrefixMatched = false;
@@ -5195,6 +5148,51 @@ public static partial class KernelMemoryCompatExports
 
         hostPath = candidate;
         return true;
+    }
+    private static string ResolveKnownMissingTitleAssetFallback(string guestPath, string resolvedPath)
+    {
+        if (File.Exists(resolvedPath))
+        {
+            return resolvedPath;
+        }
+
+        var normalizedGuestPath = guestPath.Replace('\\', '/');
+        const string fontDirectory = "/app0/data/common/font/";
+        if (!normalizedGuestPath.StartsWith(fontDirectory, StringComparison.OrdinalIgnoreCase) ||
+            normalizedGuestPath[fontDirectory.Length..].Contains('/'))
+        {
+            return resolvedPath;
+        }
+
+        var missingFont = normalizedGuestPath[fontDirectory.Length..];
+        var fallbackFont = missingFont.ToUpperInvariant() switch
+        {
+            "SIE-SHINGOPR6N-HEAVY.OTF" => "LevelNameFont_JP.otf",
+            "FUTURANOWTEXT-BD.OTF" => "FuturaNowText-XBd.otf",
+            "FUTURANOWTEXT-BLK.OTF" => "FuturaNowText-XBd.otf",
+            "FUTURASTD-BOOK.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-CONDENSED.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-CONDENSEDLIGHT.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-LIGHT.OTF" => "FuturaStd-Bold.otf",
+            "FUTURASTD-MEDIUM.OTF" => "FuturaStd-Bold.otf",
+            "HEISEIMARUGO.TTF" => "LevelNameFont_JP.otf",
+            "MOHR-LIGHTIT.OTF" => "LevelNameFont.otf",
+            _ => null,
+        };
+
+        if (fallbackFont is null)
+        {
+            return resolvedPath;
+        }
+
+        var directory = Path.GetDirectoryName(resolvedPath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return resolvedPath;
+        }
+
+        var fallbackPath = Path.Combine(directory, fallbackFont);
+        return File.Exists(fallbackPath) ? fallbackPath : resolvedPath;
     }
 
     private static string? ResolveApp0Root()
@@ -5877,6 +5875,20 @@ public static partial class KernelMemoryCompatExports
             return true;
         }
 
+        if (TryReadTrackedLibcHeapCompat(address, destination, out var trackedLibcAddress))
+        {
+            return true;
+        }
+
+        // A pointer inside a live libc allocation must never fall through to
+        // the generic VirtualQuery path. Besides allowing an out-of-bounds
+        // access, that path can race free(): the page may be released after
+        // VirtualQuery succeeds but before the managed span copy executes.
+        if (trackedLibcAddress)
+        {
+            return false;
+        }
+
         if (!TryReadHostMemory(address, destination))
         {
             return false;
@@ -5941,6 +5953,16 @@ public static partial class KernelMemoryCompatExports
         if (ctx.Memory.TryWrite(address, source))
         {
             return true;
+        }
+
+        if (TryWriteTrackedLibcHeapCompat(address, source, out var trackedLibcAddress))
+        {
+            return true;
+        }
+
+        if (trackedLibcAddress)
+        {
+            return false;
         }
 
         if (!TryWriteHostMemory(address, source))
@@ -6685,6 +6707,72 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
+    private static unsafe bool TryReadTrackedLibcHeapCompat(
+        ulong address,
+        Span<byte> destination,
+        out bool trackedAddress)
+    {
+        trackedAddress = false;
+        var length = (ulong)destination.Length;
+        lock (_libcAllocGate)
+        {
+            foreach (var (allocationAddress, allocation) in _libcAllocations)
+            {
+                var allocationSize = (ulong)allocation.Size;
+                if (address < allocationAddress || address - allocationAddress >= allocationSize)
+                {
+                    continue;
+                }
+
+                trackedAddress = true;
+                var offset = address - allocationAddress;
+                if (length > allocationSize - offset ||
+                    !IsHostRangeAccessible(address, length, writeAccess: false))
+                {
+                    return false;
+                }
+
+                new ReadOnlySpan<byte>((void*)address, destination.Length).CopyTo(destination);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static unsafe bool TryWriteTrackedLibcHeapCompat(
+        ulong address,
+        ReadOnlySpan<byte> source,
+        out bool trackedAddress)
+    {
+        trackedAddress = false;
+        var length = (ulong)source.Length;
+        lock (_libcAllocGate)
+        {
+            foreach (var (allocationAddress, allocation) in _libcAllocations)
+            {
+                var allocationSize = (ulong)allocation.Size;
+                if (address < allocationAddress || address - allocationAddress >= allocationSize)
+                {
+                    continue;
+                }
+
+                trackedAddress = true;
+                var offset = address - allocationAddress;
+                if (length > allocationSize - offset ||
+                    !IsHostRangeAccessible(address, length, writeAccess: true))
+                {
+                    return false;
+                }
+
+                source.CopyTo(new Span<byte>((void*)address, source.Length));
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     internal static bool TryReadTrackedLibcHeap(
         ulong address,
         Span<byte> destination)
@@ -6967,16 +7055,19 @@ public static partial class KernelMemoryCompatExports
             return;
         }
 
-        LibcHeapAllocation allocation;
         lock (_libcAllocGate)
         {
-            if (!_libcAllocations.Remove(address, out allocation))
+            if (!_libcAllocations.Remove(address, out var allocation))
             {
                 return;
             }
-        }
 
-        Marshal.FreeHGlobal(allocation.BaseAddress);
+            // Keep the allocation lock through the native release. Compat
+            // memcpy/read/write now hold the same lock through their copy, so
+            // no thread can pass validation and touch a page concurrently
+            // with FreeHGlobal releasing it.
+            Marshal.FreeHGlobal(allocation.BaseAddress);
+        }
     }
 
     private static bool TryMultiplyAllocationSize(ulong left, ulong right, out nuint size)

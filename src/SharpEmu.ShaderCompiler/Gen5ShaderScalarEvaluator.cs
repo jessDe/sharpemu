@@ -1388,11 +1388,12 @@ public static class Gen5ShaderScalarEvaluator
             "SWqmB32" or
             "SBrevB32" or
             "SBcnt1I32B32" or
+            "SBcnt1I32B64" or
             "SFF1I32B32" or
             "SFF1I32B64" or
             "SBitset1B32")
         {
-            if (instruction.Opcode == "SFF1I32B64")
+            if (instruction.Opcode is "SFF1I32B64" or "SBcnt1I32B64")
             {
                 if (!TryEvaluateScalarOperand64(
                         instruction.Sources[0],
@@ -1404,9 +1405,11 @@ public static class Gen5ShaderScalarEvaluator
                     return false;
                 }
 
-                registers[destination.Value] = wide == 0
-                    ? uint.MaxValue
-                    : (uint)BitOperations.TrailingZeroCount(wide);
+                registers[destination.Value] = instruction.Opcode == "SBcnt1I32B64"
+                    ? (uint)BitOperations.PopCount(wide)
+                    : wide == 0
+                        ? uint.MaxValue
+                        : (uint)BitOperations.TrailingZeroCount(wide);
                 scalarConditionCode = registers[destination.Value] != 0;
                 return true;
             }

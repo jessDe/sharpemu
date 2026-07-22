@@ -81,6 +81,48 @@ public sealed class GpuWaitRegistryTests : IDisposable
     }
 
     [Fact]
+    public void HistoricalProducer_ExtendsGraceButDoesNotBlockForever()
+    {
+        var waiter = CreateWaiter();
+        GpuWaitRegistry.RecordProduced(_memory, waiter.WaitAddress, value: 0);
+        GpuWaitRegistry.Register(waiter.WaitAddress, waiter);
+
+        var early = GpuWaitRegistry.CollectExpiredOrphanedComputeWaits(
+            _memory,
+            nowTicks: 200,
+            minAgeTicks: 100);
+        Assert.Null(early);
+
+        var released = GpuWaitRegistry.CollectExpiredOrphanedComputeWaits(
+            _memory,
+            nowTicks: 6_401,
+            minAgeTicks: 100);
+
+        Assert.Single(released!);
+        Assert.True(released![0].ProducerObservedFromHistory);
+    }
+
+    [Fact]
+    public void CurrentProducer_ReplacesHistoricalMarkerAndPreservesWait()
+    {
+        var waiter = CreateWaiter();
+        GpuWaitRegistry.RecordProduced(_memory, waiter.WaitAddress, value: 0);
+        GpuWaitRegistry.Register(waiter.WaitAddress, waiter);
+        GpuWaitRegistry.MarkProducerObservedInRange(
+            _memory,
+            waiter.WaitAddress,
+            sizeof(ulong));
+
+        var released = GpuWaitRegistry.CollectExpiredOrphanedComputeWaits(
+            _memory,
+            nowTicks: 10_000,
+            minAgeTicks: 100);
+
+        Assert.Null(released);
+        Assert.Equal(1, GpuWaitRegistry.Count);
+    }
+
+    [Fact]
     public void ExpireRetry_MakesMatchingIndirectRetryCollectible()
     {
         var waiter = CreateWaiter();

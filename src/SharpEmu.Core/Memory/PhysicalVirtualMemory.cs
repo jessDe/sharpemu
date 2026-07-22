@@ -238,7 +238,24 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var alignedSize = (size + 0xFFF) & ~0xFFFUL;
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var hostProtection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
-        var result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
+
+        // Huge data windows (e.g. the 256 GiB PRT aperture) cannot be fully
+        // committed on Windows without blowing the commit limit; reserve them
+        // and commit lazily, exactly like AllocateAt does for large regions.
+        var reservedOnly = !executable &&
+            alignedSize >= LargeDataReserveThreshold &&
+            alignedSize > FullCommitRegionLimit;
+        var result = reservedOnly
+            ? _hostMemory.Reserve(desiredAddress, alignedSize, HostPageProtection.ReadWrite)
+            : _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
+        if (result == 0 && reservedOnly && desiredAddress != 0)
+        {
+            // Preserve exact guest reservation semantics when the host cannot
+            // reserve this enormous window contiguously. Individual pages are
+            // reserved and committed by EnsureRangeCommitted on first access.
+            result = desiredAddress;
+        }
+
         if (result == 0)
         {
             return false;
@@ -252,6 +269,22 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
+        if (reservedOnly)
+        {
+            var primeBytes = Math.Min(alignedSize, LazyReservePrimeBytes);
+            ulong committedBytes = 0;
+            while (committedBytes < primeBytes)
+            {
+                var chunkBytes = Math.Min(primeBytes - committedBytes, LazyReservePrimeChunkBytes);
+                if (!_hostMemory.Commit(actualAddress + committedBytes, chunkBytes, HostPageProtection.ReadWrite))
+                {
+                    break;
+                }
+
+                committedBytes += chunkBytes;
+            }
+        }
+
         _gate.EnterWriteLock();
         try
         {
@@ -260,7 +293,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 VirtualAddress = actualAddress,
                 Size = alignedSize,
                 IsExecutable = executable,
-                IsReservedOnly = false,
+                IsReservedOnly = reservedOnly,
                 Protection = protection
             });
         }
@@ -269,7 +302,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _gate.ExitWriteLock();
         }
 
-        var allocationKind = executable ? "executable memory" : "data memory";
+        var allocationKind = reservedOnly
+            ? "reserved data memory (lazy commit)"
+            : (executable ? "executable memory" : "data memory");
         TraceVmem($"Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
         return true;
     }
@@ -317,6 +352,14 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             if (result != 0)
             {
+                reservedOnly = true;
+            }
+            else if (!allowAlternative && desiredAddress != 0)
+            {
+                // Some hosts cannot reserve a very large contiguous window even
+                // though the guest ABI requires the exact range to be reserved.
+                // Track it sparsely and reserve individual pages on first access.
+                result = desiredAddress;
                 reservedOnly = true;
             }
         }
@@ -1549,9 +1592,34 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             if (info.State == HostRegionState.Committed)
             {
+                if (NeedsCommittedProtectionRestore(info.Protection) &&
+                    !_hostMemory.Protect(pageAddress, rangeEnd - pageAddress, commitProtection, out _))
+                {
+                    return false;
+                }
+
                 // The host query proved this whole range is committed. Retain
                 // that result instead of caching only the caller's small span.
-                CacheCommittedRange(info.BaseAddress, queriedEnd, mappingGeneration);
+                CacheCommittedRange(pageAddress, rangeEnd, mappingGeneration);
+                pageAddress = rangeEnd;
+                continue;
+            }
+
+            if (info.State == HostRegionState.Free)
+            {
+                var reserveSize = rangeEnd - pageAddress;
+                if (_hostMemory.Reserve(pageAddress, reserveSize, commitProtection) != pageAddress)
+                {
+                    return false;
+                }
+
+                if (!_hostMemory.Commit(pageAddress, reserveSize, commitProtection))
+                {
+                    _hostMemory.Free(pageAddress);
+                    return false;
+                }
+
+                CacheCommittedRange(pageAddress, rangeEnd, mappingGeneration);
                 pageAddress = rangeEnd;
                 continue;
             }
@@ -1574,6 +1642,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         CacheCommittedRange(startPage, endPage, mappingGeneration);
         return true;
     }
+
+    internal static bool NeedsCommittedProtectionRestore(HostPageProtection protection) =>
+        protection == HostPageProtection.NoAccess;
 
     private void CacheCommittedRange(ulong startPage, ulong endPage, long mappingGeneration)
     {
@@ -1646,12 +1717,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private static void TraceVmem(string message)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VMEM"), "1", StringComparison.Ordinal))
+        if (Log.IsEnabled(LogLevel.Trace) || string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VMEM"), "1", StringComparison.Ordinal))
         {
-            return;
+            Log.Debug(message);
         }
-
-        Log.Debug(message);
     }
 
     public void Dispose()

@@ -1615,7 +1615,7 @@ public static partial class Gen5SpirvTranslator
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _state.Program.Instructions[index];
-                if (IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm")
+                if (IsBranch(instruction.Opcode) || IsProgramExit(instruction.Opcode))
                 {
                     continue;
                 }
@@ -1633,7 +1633,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var terminator = _state.Program.Instructions[block.EndIndex - 1];
-            if (terminator.Opcode == "SEndpgm")
+            if (IsProgramExit(terminator.Opcode))
             {
                 Store(_programActive, _module.ConstantBool(false));
                 return true;
@@ -4344,7 +4344,14 @@ public static partial class Gen5SpirvTranslator
                     };
                 }
 
-                ApplyColorComponentSwap(values, output.ComponentSwap);
+                // Keep the existing attachment permutation by default. It can
+                // be disabled for diagnostics, but doing so merely changes the
+                // solid failure color when the sampled input is missing.
+                if (Environment.GetEnvironmentVariable(
+                        "SHARPEMU_DISABLE_RENDER_TARGET_COMPONENT_SWAP") != "1")
+                {
+                    ApplyColorComponentSwap(values, output.ComponentSwap);
+                }
                 var vector = _module.AddInstruction(
                     SpirvOp.CompositeConstruct,
                     output.Type,
@@ -5526,6 +5533,9 @@ public static partial class Gen5SpirvTranslator
             opcode == "SBranch" ||
             opcode.StartsWith("SCbranch", StringComparison.Ordinal);
 
+        private static bool IsProgramExit(string opcode) =>
+            opcode is "SEndpgm" or "SSetpcB64" or "SSwappcB64";
+
         private static bool TryGetBranchTargetPc(
             Gen5ShaderInstruction instruction,
             out uint targetPc)
@@ -5568,7 +5578,7 @@ public static partial class Gen5SpirvTranslator
                     leaders.Add(targetPc);
                 }
 
-                if ((IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm") &&
+                if ((IsBranch(instruction.Opcode) || IsProgramExit(instruction.Opcode)) &&
                     index + 1 < instructions.Count)
                 {
                     leaders.Add(instructions[index + 1].Pc);
@@ -5619,7 +5629,7 @@ public static partial class Gen5SpirvTranslator
                 var block = blocks[blockIndex];
                 var terminator = instructions[block.EndIndex - 1];
                 var hasFallthrough = blockIndex + 1 < blocks.Count;
-                if (terminator.Opcode == "SEndpgm")
+                if (IsProgramExit(terminator.Opcode))
                 {
                     continue;
                 }

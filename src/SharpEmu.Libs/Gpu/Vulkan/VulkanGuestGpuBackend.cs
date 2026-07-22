@@ -348,8 +348,14 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
     public IDisposable EnterGuestQueue(string queueName, ulong submissionId) =>
         VulkanVideoPresenter.EnterGuestQueue(queueName, submissionId);
 
-    public long SubmitOrderedGuestAction(Action action, string debugName) =>
-        VulkanVideoPresenter.SubmitOrderedGuestAction(action, debugName);
+    public long SubmitOrderedGuestAction(
+        Action action,
+        string debugName,
+        bool requiresGuestMemoryVisibility = true) =>
+        VulkanVideoPresenter.SubmitOrderedGuestAction(
+            action,
+            debugName,
+            requiresGuestMemoryVisibility);
 
     public long SubmitOrderedGuestFlipWait(int videoOutHandle, int displayBufferIndex) =>
         VulkanVideoPresenter.SubmitOrderedGuestFlipWait(videoOutHandle, displayBufferIndex);

@@ -71,7 +71,10 @@ public sealed class Gen5ShaderDecoderBoundaryTests
 
         Assert.False(decoded);
         Assert.Empty(program.Instructions);
-        Assert.Equal("unknown-top pc=0x0 word=0xE4000000", error);
+        Assert.Equal(
+            "unknown-top pc=0x0 word=0xE4000000 " +
+            "at pc=0x0 word=0xE4000000 trail=[]",
+            error);
         Assert.Collection(
             memory.Reads,
             read => Assert.Equal(new MemoryRead(ShaderAddress, sizeof(uint), true), read));
@@ -88,7 +91,16 @@ public sealed class Gen5ShaderDecoderBoundaryTests
 
         Assert.False(decoded);
         Assert.Empty(program.Instructions);
-        Assert.Equal("unterminated", error);
+        Assert.Equal(
+            $"unterminated at pc=0x{MaximumInstructionCount * sizeof(uint):X} " +
+            $"(hit MaxInstructions={MaximumInstructionCount}) " +
+            "trail=[" +
+            string.Join(
+                ", ",
+                Enumerable.Range(MaximumInstructionCount - 12, 12)
+                    .Select(index => $"0x{index * sizeof(uint):X}:SNop(1dw)")) +
+            "]",
+            error);
         Assert.Equal(MaximumInstructionCount, memory.Reads.Count);
         Assert.All(memory.Reads, read => Assert.True(read.Succeeded));
         Assert.Equal(
@@ -97,6 +109,90 @@ public sealed class Gen5ShaderDecoderBoundaryTests
                 sizeof(uint),
                 true),
             memory.Reads[^1]);
+    }
+
+    [Fact]
+    public void UnconditionalBranch_SkipsInlineNonInstructionData()
+    {
+        const uint branchOverOneDword = 0xBF820001;
+        const uint inlineData = 0x00000048;
+        const uint endPgm = 0xBF810000;
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            branchOverOneDword,
+            inlineData,
+            endPgm);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Empty(error);
+        Assert.Collection(
+            program.Instructions,
+            instruction => Assert.Equal("SBranch", instruction.Opcode),
+            instruction => Assert.Equal("SEndpgm", instruction.Opcode));
+        Assert.Equal("SEndpgm", program.Instructions[^1].Opcode);
+        Assert.DoesNotContain(
+            memory.Reads,
+            read => read.Address == ShaderAddress + sizeof(uint));
+    }
+
+    [Fact]
+    public void SetPc_TerminatesReachableBlockBeforeInlineData()
+    {
+        const uint setPc = 0xBE802000;
+        const uint inlineData = 0x00000048;
+        var memory = RecordingCpuMemory.FromWords(ShaderAddress, setPc, inlineData);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Empty(error);
+        Assert.Single(program.Instructions);
+        Assert.Equal("SSetpcB64", program.Instructions[0].Opcode);
+        Assert.DoesNotContain(
+            memory.Reads,
+            read => read.Address == ShaderAddress + sizeof(uint));
+    }
+
+    [Theory]
+    [InlineData(0x89u, "VCmpLtI16")]
+    [InlineData(0xAAu, "VCmpEqU16")]
+    [InlineData(0xADu, "VCmpNeU16")]
+    [InlineData(0xC9u, "VCmpLtF16")]
+    [InlineData(0xCAu, "VCmpEqF16")]
+    [InlineData(0xCCu, "VCmpGtF16")]
+    [InlineData(0xD9u, "VCmpxLtF16")]
+    [InlineData(0xDCu, "VCmpxGtF16")]
+    [InlineData(0xE5u, "VCmpNeU64")]
+    [InlineData(0xEDu, "VCmpNeqF16")]
+    public void ReferenceVopcOpcode_IsDecoded(uint opcode, string expectedName)
+    {
+        var instruction = (0x3Eu << 25) | (opcode << 17);
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            instruction,
+            0xBF810000);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal(expectedName, program.Instructions[0].Opcode);
+    }
+
+    [Fact]
+    public void FfbhU32Opcode_IsDecoded()
+    {
+        const uint instruction = (0x3Fu << 25) | (0x39u << 9);
+        var memory = RecordingCpuMemory.FromWords(
+            ShaderAddress,
+            instruction,
+            0xBF810000);
+
+        var decoded = Decode(memory, ShaderAddress, out var program, out var error);
+
+        Assert.True(decoded, error);
+        Assert.Equal("VFfbhU32", program.Instructions[0].Opcode);
     }
 
     private static bool Decode(
